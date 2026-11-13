@@ -60,7 +60,7 @@ WID = uuid.uuid4().hex[:8]
 # lama yang masih hidup bisa membuat pool mengirim tugas ke kode yang sudah
 # tidak cocok — gejalanya 502 acak dan latensi 12-31 detik pada permintaan
 # pertama setelah deploy.
-VER_WORKER = "9"
+VER_WORKER = "10"
 _BUS = [None]          # klien MQTT untuk publish, diisi oleh listen()
 # Antrean kirim. WAJIB: `publish` dipanggil dari dalam `on_msg`, yaitu
 # thread PEMBACA mqtt. Dulu jalur cadangan di `publish` membuka koneksi baru
@@ -167,7 +167,14 @@ class Tokens:
                 m = S.post("https://outerface.venice.ai/api/app/user/client_attestation/mint",
                            headers=H, json={"count": 5, "env": ATTEST_ENV}, timeout=30)
                 m.raise_for_status()
-                self.tokens = [t["token"] for t in m.json()["tokens"]]
+                d = m.json()
+                if isinstance(d.get("token"), str):
+                    self.tokens = [d["token"]]
+                elif isinstance(d.get("tokens"), list) and d["tokens"]:
+                    self.tokens = [t["token"] if isinstance(t, dict) else str(t)
+                                   for t in d["tokens"]]
+                else:
+                    raise RuntimeError("mint: tidak ada token (%s)" % list(d.keys()))
             return self.tokens.pop(0)
 
 
