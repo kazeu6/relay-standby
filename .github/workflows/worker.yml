@@ -1,0 +1,41 @@
+name: relay
+
+# Menyalakan satu proses relay yang menganggur sambil menunggu perintah
+# lewat MQTT. Dipicu oleh pengelola di mesin lokal, bukan oleh commit.
+on:
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: topik untuk perintah masuk
+        required: true
+      pool:
+        description: topik untuk laporan keluar
+        required: false
+      idle:
+        description: detik menganggur sebelum keluar
+        required: false
+        default: '600'
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: siapkan dependensi
+        run: pip install --quiet curl_cffi
+      - name: jalankan
+        env:
+          TOPIC: ${{ inputs.topic }}
+          POOL: ${{ inputs.pool }}
+          IDLE: ${{ inputs.idle }}
+        run: |
+          # Nama repo diambil dari konteks, bukan ditulis di sini: kalau repo
+          # diganti nama, workflow ini tidak perlu diubah.
+          #
+          # `?rev=` penting: raw.githubusercontent.com di-cache ~5 menit, jadi
+          # tanpa ini proses bisa memakai versi lama beberapa menit setelah push.
+          R=${{ github.run_id }}
+          B="https://raw.githubusercontent.com/${{ github.repository }}/main"
+          curl -sS -m 30 -o /tmp/worker.py "$B/worker.py?rev=$R"
+          curl -sS -m 30 -o /tmp/mqtt.py "$B/mqtt.py?rev=$R"
+          python3 /tmp/worker.py
