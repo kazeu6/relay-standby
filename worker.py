@@ -60,7 +60,7 @@ WID = uuid.uuid4().hex[:8]
 # lama yang masih hidup bisa membuat pool mengirim tugas ke kode yang sudah
 # tidak cocok — gejalanya 502 acak dan latensi 12-31 detik pada permintaan
 # pertama setelah deploy.
-VER_WORKER = "10"
+VER_WORKER = "11"
 _BUS = [None]          # klien MQTT untuk publish, diisi oleh listen()
 # Antrean kirim. WAJIB: `publish` dipanggil dari dalam `on_msg`, yaitu
 # thread PEMBACA mqtt. Dulu jalur cadangan di `publish` membuka koneksi baru
@@ -151,7 +151,7 @@ def _pengirim(stop):
 
 
 class Tokens:
-    """Token attestation; mint ulang otomatis saat habis.
+    """Token attestation; mint ulang otomatis saat habis atau basi (TTL 240s).
 
     Dikunci karena satu worker sekarang melayani beberapa chat serentak.
     Tanpa kunci, dua thread bisa mengambil token yang sama.
@@ -159,11 +159,16 @@ class Tokens:
 
     def __init__(self):
         self.tokens = []
+        self.minted_at = 0.0
         self.lock = threading.Lock()
 
-    def get(self):
+    def get(self, paksa=False):
         with self.lock:
-            if not self.tokens:
+            # Token Venice hanya berlaku 5 menit (300 detik). Worker yang lama
+            # menganggur sebelum chat pertama datang akan memegang token basi jika
+            # tidak dicek TTL-nya.
+            if paksa or not self.tokens or (time.monotonic() - self.minted_at > 240):
+                self.tokens.clear()
                 m = S.post("https://outerface.venice.ai/api/app/user/client_attestation/mint",
                            headers=H, json={"count": 5, "env": ATTEST_ENV}, timeout=30)
                 m.raise_for_status()
@@ -175,6 +180,7 @@ class Tokens:
                                    for t in d["tokens"]]
                 else:
                     raise RuntimeError("mint: tidak ada token (%s)" % list(d.keys()))
+                self.minted_at = time.monotonic()
             return self.tokens.pop(0)
 
 
@@ -224,13 +230,18 @@ def ask(prompt, on_delta=None, on_maju=None):
     # mengulang hitungan timeout.
     r = S.post("https://outerface.venice.ai/api/inference/chat",
                headers=hdr, json=body, timeout=(10, 25), stream=True)
-    if r.status_code in (400, 403) and SAMPLING[0]:
-        SAMPLING[0] = False
-        for k in SAMPLING_BODY:
-            body.pop(k, None)
-        r = S.post("https://outerface.venice.ai/api/inference/chat",
-                   headers={**hdr, "x-venice-client-attestation": TOK.get()},
-                   json=body, timeout=(10, 25), stream=True)
+    if r.status_code in (400, 401, 403):
+        # Token basi atau sampling ditolak: paksa mint token baru
+        if SAMPLING[0]:
+            SAMPLING[0] = False
+            for k in SAMPLING_BODY:
+                body.pop(k, None)
+        try:
+            hdr["x-venice-client-attestation"] = TOK.get(paksa=True)
+            r = S.post("https://outerface.venice.ai/api/inference/chat",
+                       headers=hdr, json=body, timeout=(10, 25), stream=True)
+        except Exception:
+            pass
     ans = ""
     # Rekam SEMUA jenis pesan yang datang, dan JANGAN buang teks dari jenis
     # apa pun. Dulu hanya `kind == "content"` yang diambil. Kalau model
