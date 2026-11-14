@@ -60,7 +60,7 @@ WID = uuid.uuid4().hex[:8]
 # lama yang masih hidup bisa membuat pool mengirim tugas ke kode yang sudah
 # tidak cocok — gejalanya 502 acak dan latensi 12-31 detik pada permintaan
 # pertama setelah deploy.
-VER_WORKER = "11"
+VER_WORKER = "12"
 _BUS = [None]          # klien MQTT untuk publish, diisi oleh listen()
 # Antrean kirim. WAJIB: `publish` dipanggil dari dalam `on_msg`, yaitu
 # thread PEMBACA mqtt. Dulu jalur cadangan di `publish` membuka koneksi baru
@@ -191,6 +191,7 @@ TOK = Tokens()
 # sekali lalu lanjut tanpa sampling — tidak ada chat yang hangus.
 SAMPLING = [True]
 SAMPLING_BODY = {"temperature": 0.2, "top_p": 0.9}
+LCC = [True]
 
 
 def ask(prompt, on_delta=None, on_maju=None):
@@ -209,6 +210,8 @@ def ask(prompt, on_delta=None, on_maju=None):
     # tidak ada request yang gagal permanen.
     if SAMPLING[0]:
         body.update(SAMPLING_BODY)
+    if LCC[0] and len(prompt) >= 66000:
+        body["enableLargeContextChat"] = True
     hdr = {**H, "accept": "text/event-stream",
            "x-venice-client-attestation": TOK.get(),
            "x-venice-locale": "en-US",
@@ -232,6 +235,9 @@ def ask(prompt, on_delta=None, on_maju=None):
                headers=hdr, json=body, timeout=(10, 25), stream=True)
     if r.status_code in (400, 401, 403):
         # Token basi atau sampling ditolak: paksa mint token baru
+        if LCC[0] and "enableLargeContextChat" in body:
+            LCC[0] = False
+            body.pop("enableLargeContextChat", None)
         if SAMPLING[0]:
             SAMPLING[0] = False
             for k in SAMPLING_BODY:
