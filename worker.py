@@ -186,32 +186,39 @@ class Tokens:
 
 TOK = Tokens()
 
-# Sampling rendah (temperature/top_p) menaikkan akurasi tanpa menambah
-# latensi. Kalau endpoint menolak field ini, worker mematikannya sendiri
-# sekali lalu lanjut tanpa sampling — tidak ada chat yang hangus.
-SAMPLING = [True]
-SAMPLING_BODY = {"temperature": 0.2, "top_p": 0.9}
-LCC = [True]
+# Jalur agen: Venice menjalankan tool-nya sendiri (web search, scrape, cuaca,
+# kalkulator, image). Matikan lewat `VENICE_AGENTIC=0` untuk kembali ke
+# `/api/inference/chat` (classic) tanpa mengubah kode.
+AGENTIC = os.environ.get("VENICE_AGENTIC", "1").strip().lower() not in (
+    "0", "", "false", "no", "off")
+CHAT_URL = "https://outerface.venice.ai/api/inference/chat"
+AGENT_URL = ("https://outerface.venice.ai/api/inference/chat/agents/venice"
+             "?agentModelId=" + MODEL)
 
 
-def ask(prompt, on_delta=None, on_maju=None):
+def _agentic_body(prompt):
+    """Body agentic: `content` WAJIB array parts, bukan string (kalau string: 500)."""
+    return {"input": {"messages": [{
+        "id": str(uuid.uuid4()),
+        "role": "user",
+        "type": "message",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": prompt,
+                     "annotations": []}],
+    }]}}
+
+
+def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
     """Satu chat. Kembalikan (jawaban, status, sisa_kuota, err).
 
     Kalau `on_delta` diberikan, potongan teks dikirim begitu diterima Venice
     (`on_delta(offset, teks)`) alih-alih menunggu jawaban utuh. Offset dipakai
     supaya penerima bisa menyusun ulang walau ada potongan yang hilang —
     MQTT di sini QoS 0, jadi kehilangan potongan memang mungkin.
+
+    Dua protokol didukung: agentic (Responses API, `response.output_text.*`)
+    dan classic (`{"kind": "content"}`) saat `VENICE_AGENTIC=0`.
     """
-    body = {"modelId": MODEL,
-            "prompt": [{"role": "user", "content": prompt}],
-            "requestId": str(uuid.uuid4())}
-    # Sampling rendah: akurasi & konsistensi naik, latensi tidak berubah.
-    # Kalau Venice menolak field-nya, matikan otomatis sekali saja supaya
-    # tidak ada request yang gagal permanen.
-    if SAMPLING[0]:
-        body.update(SAMPLING_BODY)
-    if LCC[0] and len(prompt) >= 66000:
-        body["enableLargeContextChat"] = True
     hdr = {**H, "accept": "text/event-stream",
            "x-venice-client-attestation": TOK.get(),
            "x-venice-locale": "en-US",
@@ -231,36 +238,90 @@ def ask(prompt, on_delta=None, on_maju=None):
     # `_DIAM` pool (45 detik), jadi worker membebaskan slotnya sendiri. Tidak
     # berbahaya untuk generasi panjang: token datang terus, dan tiap baris SSE
     # mengulang hitungan timeout.
-    r = S.post("https://outerface.venice.ai/api/inference/chat",
-               headers=hdr, json=body, timeout=(10, 25), stream=True)
-    if r.status_code in (400, 401, 403):
-        # Token basi atau sampling ditolak: paksa mint token baru
-        if LCC[0] and "enableLargeContextChat" in body:
-            LCC[0] = False
-            body.pop("enableLargeContextChat", None)
-        if SAMPLING[0]:
-            SAMPLING[0] = False
-            for k in SAMPLING_BODY:
-                body.pop(k, None)
+    if AGENTIC:
+        url, body = AGENT_URL, _agentic_body(prompt)
+    else:
+        url, body = CHAT_URL, {"modelId": MODEL,
+                               "prompt": [{"role": "user", "content": prompt}],
+                               "requestId": str(uuid.uuid4())}
+    r = S.post(url, headers=hdr, json=body, timeout=(10, 25), stream=True)
+    if r.status_code in (401, 403):
+        # Token basi: paksa mint token baru, lalu ulangi sekali.
         try:
             hdr["x-venice-client-attestation"] = TOK.get(paksa=True)
-            r = S.post("https://outerface.venice.ai/api/inference/chat",
-                       headers=hdr, json=body, timeout=(10, 25), stream=True)
+            r = S.post(url, headers=hdr, json=body, timeout=(10, 25),
+                       stream=True)
         except Exception:
             pass
+    if r.status_code != 200:
+        try:
+            err = (r.text or "")[:300].replace("\n", " ")
+        except Exception:
+            err = ""
+        return "", r.status_code, r.headers.get("x-ratelimit-remaining"), \
+            err or ("HTTP %s tanpa body" % r.status_code)
+
     ans = ""
-    # Rekam SEMUA jenis pesan yang datang, dan JANGAN buang teks dari jenis
-    # apa pun. Dulu hanya `kind == "content"` yang diambil. Kalau model
-    # mengeluarkan jenis lain (reasoning/thinking/text), jawabannya kosong
-    # padahal token terpakai — gejalanya persis "provider reported 94 output
-    # tokens, but no text or tool calls were delivered".
-    kinds = {}
-    lain = []
-    cadangan = ""          # teks dari jenis selain "content"
+    cadangan = ""          # teks dari jenis selain jawaban (classic)
+    jenis = {}             # penghitung event untuk pesan error
+    tipe_item = {}         # item_id -> message/reasoning (agentic)
+    pesan = []             # teks final item `message` (agentic)
+    ev = ""
 
     def proses(ln):
-        """Urai satu baris SSE. Kembalikan True kalau ada TEKS yang dihasilkan."""
-        nonlocal ans, cadangan
+        """Urai satu baris. Kembalikan True kalau ada TEKS yang dihasilkan."""
+        nonlocal ans, cadangan, ev
+        if AGENTIC:
+            if ln.startswith("event: "):
+                ev = ln[7:].strip()
+                jenis[ev] = jenis.get(ev, 0) + 1
+                return False
+            if ln.startswith(":"):
+                # Keepalive: server masih mengerjakan, tapi belum ada teks.
+                # Dihitung sebagai bukti hidup supaya pool tidak membunuh agen
+                # yang sedang berpikir panjang sebelum byte pertama.
+                return True
+            if not ln.startswith("data: "):
+                return False
+            data = ln[6:]
+            if data == "[DONE]":
+                return False
+            try:
+                o = json.loads(data)
+            except Exception:
+                return False
+            if not isinstance(o, dict):
+                return False
+            if ev == "response.output_item.added":
+                it = o.get("item") or {}
+                if it.get("id") and it.get("type"):
+                    tipe_item[it["id"]] = it["type"]
+                return False
+            if ev == "response.output_text.delta":
+                # Delta reasoning jangan diteruskan: itu proses berpikir.
+                if tipe_item.get(o.get("item_id") or "") == "reasoning":
+                    return False
+                potong = o.get("delta") or ""
+                if potong:
+                    ans += potong
+                    if on_delta:
+                        on_delta(len(ans) - len(potong), potong)
+                    return True
+                return False
+            if ev == "response.output_item.done":
+                it = o.get("item") or {}
+                if it.get("type") == "message":
+                    t = "".join(p.get("text") or ""
+                                for p in (it.get("content") or [])
+                                if p.get("type") == "output_text")
+                    if t:
+                        pesan.append(t)
+                return False
+            if ev in ("response.failed", "error"):
+                cadangan = str(o.get("message") or o.get("error") or "")[:300]
+            return False
+
+        # Jalur classic.
         try:
             o = json.loads(ln)
         except Exception:
@@ -268,7 +329,7 @@ def ask(prompt, on_delta=None, on_maju=None):
         if not isinstance(o, dict):
             return False
         k = o.get("kind") or "(tanpa kind)"
-        kinds[k] = kinds.get(k, 0) + 1
+        jenis[k] = jenis.get(k, 0) + 1
         if k == "content":
             potong = o.get("content") or ""
             if potong:
@@ -277,7 +338,6 @@ def ask(prompt, on_delta=None, on_maju=None):
                     on_delta(len(ans) - len(potong), potong)
                 return True
             return False
-        # Jenis lain: ambil teks apa pun yang ada, jangan dibuang.
         potong = ""
         for f in ("content", "text", "reasoning", "thinking", "delta"):
             v = o.get(f)
@@ -285,14 +345,12 @@ def ask(prompt, on_delta=None, on_maju=None):
                 potong += v
         if potong:
             cadangan += potong
-            if len(lain) < 3:
-                lain.append({k: str(o)[:160]})
-            return True
-        if len(lain) < 3:
-            lain.append({k: str(o)[:160]})
         return False
 
     for ln in r.iter_lines():
+        if stop_check and stop_check():
+            r.close()
+            return "", 499, 0, "dibatalkan pengelola"
         if isinstance(ln, bytes):
             ln = ln.decode("utf-8", "replace")
         if not ln:
@@ -310,32 +368,25 @@ def ask(prompt, on_delta=None, on_maju=None):
         if teks_datang and on_maju:
             on_maju(len(ln))
 
-    # Kalau `content` kosong tetapi ada teks di jenis lain, pakai itu.
-    # Lebih baik menampilkan teks yang mungkin berupa proses berpikir
-    # daripada mengirim balasan kosong ke klien.
-    if not ans.strip() and cadangan.strip():
+    # Item `message` (agentic) lebih dipercaya daripada akumulasi delta.
+    if pesan:
+        ans = "".join(pesan)
+    elif not ans.strip() and cadangan.strip():
         ans = cadangan
 
-    # Kalau gagal, sertakan potongan body asli. Tanpa ini, semua kegagalan
-    # tampil sebagai "HTTP 400" tanpa petunjuk apa pun.
-    err = ""
-    if r.status_code != 200:
-        try:
-            # `stream=True` tidak menyimpan body di `.text`; baca sisa baris
-            # mentah supaya pesan error Venice tetap terlihat.
-            mentah = b"".join(r.iter_content(4096)) if hasattr(r, "iter_content") else b""
-            err = mentah.decode("utf-8", "replace").strip()[:200].replace("\n", " ")
-        except Exception:
-            err = ""
-        if not err:
-            err = "HTTP %s tanpa body" % r.status_code
-    elif not ans:
-        # kasus paling licin: HTTP 200, token terpakai, teks kosong
-        err = ("kosong; kinds=%s contoh=%s" % (kinds, lain))[:300]
-    return ans.strip(), r.status_code, r.headers.get("x-ratelimit-remaining"), err
+    if r.status_code == 200 and not ans.strip():
+        err = ("kosong; jenis=%s contoh=%s"
+               % ({k: v for k, v in list(jenis.items())[:6]},
+                  cadangan[:120]))[:300]
+    elif r.status_code == 200:
+        err = ""
+    else:
+        err = "HTTP %s" % r.status_code
+    return ans.strip(), r.status_code, \
+        r.headers.get("x-ratelimit-remaining"), err
 
 
-def ask_ulang(prompt, coba=2, on_delta=None, on_maju=None):
+def ask_ulang(prompt, coba=2, on_delta=None, on_maju=None, stop_check=None):
     """`ask` dengan percobaan ulang kalau balasannya kosong.
 
     Venice kadang membalas 200 dengan token terpakai tetapi tanpa teks.
@@ -350,15 +401,15 @@ def ask_ulang(prompt, coba=2, on_delta=None, on_maju=None):
     potongan lama sebelum percobaan baru dimulai.
     """
     ans, status, rem, err = ask(prompt, on_delta=on_delta,
-                                on_maju=on_maju)
+                                on_maju=on_maju, stop_check=stop_check)
     for _ in range(coba):
-        if ans or status != 200:
+        if ans or status != 200 or (stop_check and stop_check()):
             break
         time.sleep(0.4)
         if on_delta:
             on_delta(-1, "")
         ans, status, rem, err = ask(prompt, on_delta=on_delta,
-                                    on_maju=on_maju)
+                                    on_maju=on_maju, stop_check=stop_check)
     return ans, status, rem, err
 
 
@@ -416,6 +467,7 @@ def main():
     used = [0]                       # chat yang benar-benar dijawab
     doing = [0]                      # chat yang sedang dikerjakan
     seen = {}                        # tid -> payload hasil (dedupe kirim ulang)
+    batal_set = set()                # tid yang dibatalkan pengelola
     kunci = threading.Lock()
     # Kapan terakhir pengelola menyapa. Worker yang tidak pernah disapa lagi
     # berarti pengelolanya sudah mati atau berganti topik: ia harus keluar
@@ -448,6 +500,13 @@ def main():
                 # sampai timeout. Sekarang berhenti menerima tugas baru,
                 # lalu keluar setelah yang sedang jalan selesai.
                 draining.set()
+            return
+
+        if task.get("t") == "cancel":
+            cid = task.get("id")
+            if task.get("to") in (WID, "any") and cid:
+                with kunci:
+                    batal_set.add(cid)
             return
 
         if task.get("t") != "ask":
@@ -582,7 +641,8 @@ def main():
             try:
                 ans, status, rem, err = ask_ulang(task.get("prompt", ""),
                                                   on_delta=on_delta,
-                                                  on_maju=catat_maju)
+                                                  on_maju=catat_maju,
+                                                  stop_check=lambda: tid in batal_set)
             except Exception as e:
                 nadi_stop.set()
                 with kunci:
@@ -591,6 +651,14 @@ def main():
                            "err": str(e)[:150], "used": used[0]}
                     seen[tid] = res
                 publish(POOL, res, penting=True)
+                return
+
+            if tid in batal_set:
+                nadi_stop.set()
+                with kunci:
+                    doing[0] = max(0, doing[0] - 1)
+                    batal_set.discard(tid)
+                print("[kerja] tugas %s dibatalkan pengelola, keluar" % tid, flush=True)
                 return
             # Tugas selesai: hentikan detak sebelum hasil dikirim, supaya
             # tidak ada "n" yang datang setelah "res" dan membingungkan
