@@ -17,8 +17,8 @@ jobs:
       - name: Siapkan Python & dependensi
         run: |
           pip install --quiet curl_cffi
-      - name: Jalankan probe ad-hoc
+      - name: Jalankan probe clientTools & adhoc
         env:
           VENICE_JWT: ${{ inputs.jwt }}
         run: |
-          python3 uji_adhoc_runner.py
+          python3 uji_clienttools.py
