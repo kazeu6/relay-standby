@@ -9,9 +9,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Siapkan Python & dependensi
         run: |
           pip install --quiet curl_cffi
-      - name: Jalankan probe detail bypass
+
+      - name: Jalankan uji detail bypass
         run: |
           python3 uji_detail_bypass.py
+
+      - name: Jalankan uji built-in tools
+        run: |
+          python3 uji_built_in_tools.py
