@@ -2,11 +2,6 @@ name: uji_adhoc
 
 on:
   workflow_dispatch:
-    inputs:
-      jwt:
-        description: 'Token JWT jika ada'
-        required: false
-        default: ''
 
 jobs:
   test:
@@ -17,6 +12,6 @@ jobs:
       - name: Siapkan Python & dependensi
         run: |
           pip install --quiet curl_cffi
-      - name: Jalankan probe bypass tools
+      - name: Jalankan probe detail bypass
         run: |
-          python3 uji_bypass_tools.py
+          python3 uji_detail_bypass.py
