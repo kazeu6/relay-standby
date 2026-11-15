@@ -1,0 +1,24 @@
+name: uji_adhoc
+
+on:
+  workflow_dispatch:
+    inputs:
+      jwt:
+        description: 'Token JWT jika ada'
+        required: false
+        default: ''
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Siapkan Python & dependensi
+        run: |
+          pip install --quiet curl_cffi
+      - name: Jalankan probe ad-hoc
+        env:
+          VENICE_JWT: ${{ inputs.jwt }}
+        run: |
+          python3 uji_adhoc_runner.py
