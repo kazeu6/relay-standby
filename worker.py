@@ -266,6 +266,8 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
     jenis = {}             # penghitung event untuk pesan error
     tipe_item = {}         # item_id -> message/reasoning (agentic)
     pesan = []             # teks final item `message` (agentic)
+    gagal = [""]           # pesan response.failed/error (agentic)
+    selesai = [False]      # stream sudah ditutup server
     ev = ""
 
     def proses(ln):
@@ -285,6 +287,7 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
                 return False
             data = ln[6:]
             if data == "[DONE]":
+                selesai[0] = True
                 return False
             try:
                 o = json.loads(data)
@@ -318,7 +321,9 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
                         pesan.append(t)
                 return False
             if ev in ("response.failed", "error"):
-                cadangan = str(o.get("message") or o.get("error") or "")[:300]
+                gagal[0] = str(o.get("message") or o.get("error")
+                               or o.get("response") or "")[:300]
+                selesai[0] = True
             return False
 
         # Jalur classic.
@@ -367,6 +372,9 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
         # prompt "hi".
         if teks_datang and on_maju:
             on_maju(len(ln))
+        if selesai[0]:
+            r.close()
+            break
 
     # Item `message` (agentic) lebih dipercaya daripada akumulasi delta.
     if pesan:
@@ -374,7 +382,9 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
     elif not ans.strip() and cadangan.strip():
         ans = cadangan
 
-    if r.status_code == 200 and not ans.strip():
+    if r.status_code == 200 and gagal[0] and not ans.strip():
+        err = gagal[0]
+    elif r.status_code == 200 and not ans.strip():
         err = ("kosong; jenis=%s contoh=%s"
                % ({k: v for k, v in list(jenis.items())[:6]},
                   cadangan[:120]))[:300]
