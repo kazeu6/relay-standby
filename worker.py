@@ -189,7 +189,7 @@ TOK = Tokens()
 # Jalur agen: Venice menjalankan tool-nya sendiri (web search, scrape, cuaca,
 # kalkulator, image). Matikan lewat `VENICE_AGENTIC=0` untuk kembali ke
 # `/api/inference/chat` (classic) tanpa mengubah kode.
-AGENTIC = os.environ.get("VENICE_AGENTIC", "1").strip().lower() not in (
+AGENTIC = os.environ.get("VENICE_AGENTIC", "0").strip().lower() not in (
     "0", "", "false", "no", "off")
 CHAT_URL = "https://outerface.venice.ai/api/inference/chat"
 AGENT_URL = ("https://outerface.venice.ai/api/inference/chat/agents/venice"
@@ -311,6 +311,18 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
                         on_delta(len(ans) - len(potong), potong)
                     return True
                 return False
+            if ev == "veniceai:tool_call_generation.in_progress":
+                if o.get("detected_tools"):
+                    selesai[0] = True
+                    return False
+            if ev == "response.function_call_arguments.delta":
+                potong = o.get("delta") or ""
+                if potong:
+                    ans += potong
+                    if on_delta:
+                        on_delta(len(ans) - len(potong), potong)
+                    return True
+                return False
             if ev == "response.output_item.done":
                 it = o.get("item") or {}
                 if it.get("type") == "message":
@@ -319,6 +331,12 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
                                 if p.get("type") == "output_text")
                     if t:
                         pesan.append(t)
+                elif it.get("type") == "function_call":
+                    fn_name = it.get("name") or "tool"
+                    fn_args = it.get("arguments") or "{}"
+                    if isinstance(fn_args, dict):
+                        fn_args = json.dumps(fn_args, ensure_ascii=False)
+                    pesan.append('<tool_call>{"name": "%s", "arguments": %s}</tool_call>' % (fn_name, fn_args))
                 return False
             if ev in ("response.failed", "error"):
                 gagal[0] = str(o.get("message") or o.get("error")
@@ -376,9 +394,15 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
             r.close()
             break
 
-    # Item `message` (agentic) lebih dipercaya daripada akumulasi delta.
+    # Item `message` (agentic) lebih dipercaya daripada akumulasi delta,
+    # kecuali jika delta memuat blok tool call yang tidak ada di pesan.
+    tanda_tool = ("<tool_call", "<invoke", "<function_call", "｜dsml｜")
     if pesan:
-        ans = "".join(pesan)
+        teks_pesan = "".join(pesan)
+        if any(m in ans for m in tanda_tool) and not any(m in teks_pesan for m in tanda_tool):
+            pass
+        else:
+            ans = teks_pesan
     elif not ans.strip() and cadangan.strip():
         ans = cadangan
 
