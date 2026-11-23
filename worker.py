@@ -45,7 +45,7 @@ MQTT_TLS = os.environ.get("MQTT_TLS", "1").strip().lower() not in (
 MQTT_USER = os.environ.get("MQTT_USER") or None
 MQTT_PASS = os.environ.get("MQTT_PASS") or None
 WID = uuid.uuid4().hex[:8]
-VER_WORKER = "14"
+VER_WORKER = "15"
 
 _BUS = [None]
 _KIRIM = []

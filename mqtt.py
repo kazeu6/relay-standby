@@ -5,6 +5,7 @@ Mendukung CONNECT/CONNACK, PUBLISH (QoS 0), SUBSCRIBE/SUBACK, PINGREQ/PINGRESP,
 deteksi koneksi half-open TCP, batas ukuran paket maksimum, serta penutupan
 socket yang thread-safe.
 """
+import select
 import socket
 import ssl
 import struct
@@ -157,11 +158,45 @@ class Client:
         self._buf = b[total:]
         return b1 >> 4, b1 & 0x0F, body
 
-    def _read_packet(self):
-        """Tunggu sampai satu paket utuh. `socket.timeout` = belum ada paket."""
+    def _read_packet(self, timeout=2.0):
+        """Tunggu sampai satu paket utuh tanpa memblokir `publish()` pada SSLSocket.
+
+        Pada CPython/OpenSSL, `SSLSocket.recv()` dan `SSLSocket.sendall()` tidak
+        aman/saling mengunci bila berjalan serentak dari dua thread. Memakai
+        `select.select()` di luar `_lock` lalu membaca singkat di dalam `_lock`
+        menghilangkan stall 2-4 detik dan menjaga mutual exclusion OpenSSL.
+        """
         p = self._parse()
+        if p is not None:
+            return p
+        deadline = time.monotonic() + max(0.05, float(timeout))
         while p is None:
-            chunk = self.sock.recv(65536)
+            if self._stop.is_set():
+                raise ConnectionError("MQTT dihentikan")
+            with self._lock:
+                s = self.sock
+                if s is None or not self.connected:
+                    raise ConnectionError("koneksi MQTT ditutup")
+                has_pending = getattr(s, "pending", lambda: 0)() > 0
+            if not has_pending:
+                sisa = deadline - time.monotonic()
+                if sisa <= 0:
+                    raise socket.timeout("belum ada paket MQTT")
+                try:
+                    ready, _, _ = select.select([s], [], [], min(0.05, sisa))
+                except (OSError, ValueError):
+                    raise ConnectionError("socket MQTT ditutup")
+                if not ready:
+                    continue
+            with self._lock:
+                s = self.sock
+                if s is None or not self.connected:
+                    raise ConnectionError("koneksi MQTT ditutup")
+                try:
+                    s.settimeout(0.25)
+                    chunk = s.recv(65536)
+                except (socket.timeout, ssl.SSLWantReadError):
+                    continue
             if not chunk:
                 raise ConnectionError("koneksi MQTT ditutup")
             self._buf += chunk
@@ -189,6 +224,8 @@ class Client:
         if not self.sock or not self.connected:
             raise ConnectionError("MQTT tidak tersambung")
         try:
+            # Pastikan timeout tulis cukup longgar untuk payload besar (hingga 500KB).
+            self.sock.settimeout(10.0)
             self.sock.sendall(data)
         except Exception:
             self.connected = False
@@ -239,11 +276,7 @@ class Client:
                 self.connected = False
                 raise TimeoutError("SUBACK timeout untuk topik %s" % topic)
             try:
-                self.sock.settimeout(min(2.0, sisa))
-            except OSError:
-                pass
-            try:
-                ptype, flags, body = self._read_packet()
+                ptype, flags, body = self._read_packet(timeout=min(2.0, sisa))
             except socket.timeout:
                 continue
             if ptype == SUBACK and len(body) >= 3:
@@ -295,11 +328,7 @@ class Client:
             if s is None or not self.connected:
                 return
             try:
-                s.settimeout(read_to)
-            except Exception:
-                pass
-            try:
-                ptype, flags, body = self._read_packet()
+                ptype, flags, body = self._read_packet(timeout=read_to)
             except socket.timeout:
                 ptype = None
             except Exception:
