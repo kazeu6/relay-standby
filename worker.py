@@ -47,7 +47,7 @@ MQTT_TLS = os.environ.get("MQTT_TLS", "1").strip().lower() not in (
 MQTT_USER = os.environ.get("MQTT_USER") or None
 MQTT_PASS = os.environ.get("MQTT_PASS") or None
 WID = uuid.uuid4().hex[:8]
-VER_WORKER = "16"
+VER_WORKER = "17"
 
 _BUS = [None]
 _KIRIM = []
@@ -161,32 +161,66 @@ class Tokens:
 
 TOK = Tokens()
 
-# Default "1" (/api/inference/chat/agents/venice): satu-satunya jalur anonim
-# yang benar-benar menghormati konteks besar (1M char verbatim; 1.8M-4M char
-# dengan auto-compaction server) tanpa silent truncation ~45k char seperti classic.
-AGENTIC = os.environ.get("VENICE_AGENTIC", "1").strip().lower() not in (
-    "0", "", "false", "no", "off")
+# Jalur murni Classic `/api/inference/chat`: nol hidden prompt Venice, nol 20
+# native server tool, dan tembus 1.000.000 char verbatim dengan `isFile: true`
+# + `enableLargeContextChat: true` + `includeVeniceSystemPrompt: false`.
 CHAT_URL = "https://outerface.venice.ai/api/inference/chat"
-AGENT_URL = ("https://outerface.venice.ai/api/inference/chat/agents/venice"
-             "?agentModelId=" + MODEL)
 
 _HTTP_TIMEOUT = (15, 120)
 
 _LCC_LOCK = threading.Lock()
 _LCC = [True]
 _LCC_MIN_CHARS = 66000
+_ISFILE_MIN_CHARS = 40000
+_SYS_MAX_CHARS = 32000
+_SEP_PERCAKAPAN = "\n\n===== PERCAKAPAN =====\n\n"
 
 
-def _agentic_body(prompt):
-    """Body agentic: `content` WAJIB array parts, bukan string (kalau string: 500)."""
-    return {"input": {"messages": [{
-        "id": str(uuid.uuid4()),
-        "role": "user",
-        "type": "message",
-        "status": "completed",
-        "content": [{"type": "output_text", "text": prompt,
-                     "annotations": []}],
-    }]}}
+def _opsi_reasoning():
+    """Baca env `VENICE_REASONING` (`"0"` -> False, `"1"` -> True, kosong -> default server)."""
+    v = os.environ.get("VENICE_REASONING", "").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    if v in ("1", "true", "ya", "yes", "on"):
+        return True
+    return None
+
+
+def _classic_body(prompt, lcc_on=True):
+    """Bangun body Classic `/api/inference/chat` tanpa truncation hingga 1M char."""
+    body = {
+        "modelId": MODEL,
+        "requestId": str(uuid.uuid4()),
+        "includeVeniceSystemPrompt": False,
+        "webEnabled": False,
+        "webScrapeEnabled": False,
+        "xSearchEnabled": False,
+    }
+    reas = _opsi_reasoning()
+    if reas is not None:
+        body["reasoning"] = reas
+
+    isi = prompt or ""
+    if _SEP_PERCAKAPAN in isi:
+        kepala, ekor = isi.split(_SEP_PERCAKAPAN, 1)
+        if kepala.strip() and len(kepala) <= _SYS_MAX_CHARS and ekor.strip():
+            body["systemPrompt"] = kepala.strip()
+            isi = ekor
+
+    if len(isi) >= _ISFILE_MIN_CHARS:
+        body["prompt"] = [
+            {"role": "user", "content": isi, "isFile": True},
+            {"role": "user", "content": (
+                "Lanjutkan percakapan di atas dan balas langsung sebagai "
+                "Assistant sesuai instruksi sistem."
+            )},
+        ]
+    else:
+        body["prompt"] = [{"role": "user", "content": isi}]
+
+    if lcc_on and len(prompt or "") >= _LCC_MIN_CHARS:
+        body["enableLargeContextChat"] = True
+    return body
 
 
 def _tutup_resp(r):
@@ -198,7 +232,7 @@ def _tutup_resp(r):
 
 
 def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
-    """Satu chat. Kembalikan (jawaban, status, sisa_kuota, err)."""
+    """Satu chat murni lewat Classic `/api/inference/chat`. Kembalikan (jawaban, status, sisa_kuota, err)."""
     sesi = _session()
     hdr = {**H, "accept": "text/event-stream",
            "x-venice-client-attestation": TOK.get(),
@@ -206,25 +240,18 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
            "x-venice-middleface-version": MIDDLEFACE,
            "x-venice-request-timestamp-ms": str(int(time.time() * 1000)),
            "x-venice-version": VER}
-    if AGENTIC:
-        url, body = AGENT_URL, _agentic_body(prompt)
-    else:
-        url, body = CHAT_URL, {"modelId": MODEL,
-                               "prompt": [{"role": "user", "content": prompt}],
-                               "requestId": str(uuid.uuid4())}
-        with _LCC_LOCK:
-            lcc_on = _LCC[0]
-        if lcc_on and len(prompt) >= _LCC_MIN_CHARS:
-            body["enableLargeContextChat"] = True
+    with _LCC_LOCK:
+        lcc_on = _LCC[0]
+    body = _classic_body(prompt, lcc_on=lcc_on)
 
-    r = sesi.post(url, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
+    r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
     try:
         if r.status_code == 400 and body.get("enableLargeContextChat"):
             _tutup_resp(r)
             with _LCC_LOCK:
                 _LCC[0] = False
             body.pop("enableLargeContextChat", None)
-            r = sesi.post(url, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
+            r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
         if r.status_code in (401, 403):
             try:
                 tok_baru = TOK.get(paksa=True)
@@ -233,7 +260,7 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
             if tok_baru:
                 _tutup_resp(r)
                 hdr["x-venice-client-attestation"] = tok_baru
-                r = sesi.post(url, headers=hdr, json=body, timeout=_HTTP_TIMEOUT,
+                r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT,
                               stream=True)
         if r.status_code != 200:
             try:
@@ -246,91 +273,19 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
         ans = ""
         cadangan = ""
         jenis = {}
-        tipe_item = {}
-        pesan = []
-        gagal = [""]
-        selesai = [False]
-        ev = ""
+        dalam_think = [False]
+
+        def emit(potong):
+            nonlocal ans
+            if not potong:
+                return
+            ans += potong
+            if on_delta:
+                on_delta(len(ans) - len(potong), potong)
 
         def proses(ln):
-            """Urai satu baris. Kembalikan True kalau ada kemajuan nyata."""
-            nonlocal ans, cadangan, ev
-            if AGENTIC:
-                if ln.startswith("event: "):
-                    ev = ln[7:].strip()
-                    jenis[ev] = jenis.get(ev, 0) + 1
-                    return False
-                if ln.startswith(":"):
-                    return True
-                if not ln.startswith("data: "):
-                    return False
-                data = ln[6:]
-                if data == "[DONE]":
-                    selesai[0] = True
-                    return False
-                try:
-                    o = json.loads(data)
-                except Exception:
-                    return False
-                if not isinstance(o, dict):
-                    return False
-                if ev in ("response.created", "response.in_progress"):
-                    # Tanda server mulai memproses/prefill prompt besar.
-                    return True
-                if ev == "response.output_item.added":
-                    it = o.get("item") or {}
-                    if it.get("id") and it.get("type"):
-                        tipe_item[it["id"]] = it["type"]
-                    return True
-                if ev == "response.output_text.delta":
-                    if tipe_item.get(o.get("item_id") or "") == "reasoning":
-                        return True
-                    potong = o.get("delta") or ""
-                    if potong:
-                        ans += potong
-                        if on_delta:
-                            on_delta(len(ans) - len(potong), potong)
-                        return True
-                    return False
-                if ev.startswith("veniceai:"):
-                    # Server sedang menjalankan context_compaction / context_grep /
-                    # tool_call_generation; JANGAN putus stream dan teruskan denyut maju.
-                    return True
-                if ev == "response.function_call_arguments.delta":
-                    # Argumen partial jangan dibocorkan sebagai teks biasa ke klien;
-                    # cukup laporkan tanda kemajuan agar pool tidak timeout.
-                    return bool(o.get("delta"))
-                if ev == "response.output_item.done":
-                    it = o.get("item") or {}
-                    if it.get("type") == "message":
-                        t = "".join(p.get("text") or ""
-                                    for p in (it.get("content") or [])
-                                    if p.get("type") == "output_text")
-                        if t:
-                            pesan.append(t)
-                    elif it.get("type") == "function_call":
-                        fn_name = str(it.get("name") or "tool")
-                        raw_args = it.get("arguments")
-                        if isinstance(raw_args, str):
-                            try:
-                                parsed_args = json.loads(raw_args)
-                            except Exception:
-                                parsed_args = {"_raw": raw_args}
-                        elif isinstance(raw_args, dict):
-                            parsed_args = raw_args
-                        else:
-                            parsed_args = {}
-                        pesan.append("<tool_call>" + json.dumps(
-                            {"name": fn_name, "arguments": parsed_args},
-                            ensure_ascii=False) + "</tool_call>")
-                    return False
-                if ev in ("response.failed", "error"):
-                    gagal[0] = str(o.get("message") or o.get("error")
-                                   or o.get("response") or "")[:300]
-                    selesai[0] = True
-                return False
-
-            # Jalur classic.
+            """Urai satu baris NDJSON Classic. Kembalikan True kalau ada kemajuan nyata."""
+            nonlocal cadangan
             try:
                 o = json.loads(ln)
             except Exception:
@@ -339,12 +294,23 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
                 return False
             k = o.get("kind") or "(tanpa kind)"
             jenis[k] = jenis.get(k, 0) + 1
+            if k in ("reasoning", "thinking"):
+                potong = o.get("content") or o.get("reasoning") or o.get("thinking") or ""
+                if potong:
+                    cadangan += potong
+                    if not dalam_think[0]:
+                        dalam_think[0] = True
+                        emit("<think>")
+                    emit(potong)
+                    return True
+                return False
             if k == "content":
                 potong = o.get("content") or ""
                 if potong:
-                    ans += potong
-                    if on_delta:
-                        on_delta(len(ans) - len(potong), potong)
+                    if dalam_think[0]:
+                        dalam_think[0] = False
+                        emit("</think>")
+                    emit(potong)
                     return True
                 return False
             potong = ""
@@ -366,22 +332,15 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
             teks_datang = proses(ln)
             if teks_datang and on_maju:
                 on_maju(len(ln))
-            if selesai[0]:
-                break
 
-        tanda_tool = ("<tool_call", "<invoke", "<function_call", "｜dsml｜")
-        if pesan:
-            teks_pesan = "".join(pesan)
-            if any(m in ans for m in tanda_tool) and not any(m in teks_pesan for m in tanda_tool):
-                pass
-            else:
-                ans = teks_pesan
-        elif not ans.strip() and cadangan.strip():
+        if dalam_think[0]:
+            dalam_think[0] = False
+            emit("</think>")
+
+        if not ans.strip() and cadangan.strip():
             ans = cadangan
 
-        if r.status_code == 200 and gagal[0] and not ans.strip():
-            err = gagal[0]
-        elif r.status_code == 200 and not ans.strip():
+        if r.status_code == 200 and not ans.strip():
             err = ("kosong; jenis=%s contoh=%s"
                    % ({k: v for k, v in list(jenis.items())[:6]},
                       cadangan[:120]))[:300]

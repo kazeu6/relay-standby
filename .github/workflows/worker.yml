@@ -28,7 +28,6 @@ jobs:
           TOPIC: ${{ inputs.topic }}
           POOL: ${{ inputs.pool }}
           IDLE: ${{ inputs.idle }}
-          VENICE_AGENTIC: "1"
         run: |
           # Nama repo diambil dari konteks, bukan ditulis di sini: kalau repo
           # diganti nama, workflow ini tidak perlu diubah.
