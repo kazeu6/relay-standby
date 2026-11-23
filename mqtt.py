@@ -224,8 +224,8 @@ class Client:
         if not self.sock or not self.connected:
             raise ConnectionError("MQTT tidak tersambung")
         try:
-            # Pastikan timeout tulis cukup longgar untuk payload besar (hingga 500KB).
-            self.sock.settimeout(10.0)
+            # Timeout tulis longgar untuk payload besar terkompresi (hingga beberapa MB).
+            self.sock.settimeout(30.0)
             self.sock.sendall(data)
         except Exception:
             self.connected = False

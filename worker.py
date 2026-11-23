@@ -9,12 +9,14 @@ Env:
   POOL   topik MQTT untuk laporan (default TOPIC + "-p")
   IDLE   detik menganggur sebelum keluar (default 600)
 """
+import base64
 import json
 import os
 import sys
 import threading
 import time
 import uuid
+import zlib
 
 from curl_cffi import requests as cr
 
@@ -45,7 +47,7 @@ MQTT_TLS = os.environ.get("MQTT_TLS", "1").strip().lower() not in (
 MQTT_USER = os.environ.get("MQTT_USER") or None
 MQTT_PASS = os.environ.get("MQTT_PASS") or None
 WID = uuid.uuid4().hex[:8]
-VER_WORKER = "15"
+VER_WORKER = "16"
 
 _BUS = [None]
 _KIRIM = []
@@ -159,11 +161,16 @@ class Tokens:
 
 TOK = Tokens()
 
-AGENTIC = os.environ.get("VENICE_AGENTIC", "0").strip().lower() not in (
+# Default "1" (/api/inference/chat/agents/venice): satu-satunya jalur anonim
+# yang benar-benar menghormati konteks besar (1M char verbatim; 1.8M-4M char
+# dengan auto-compaction server) tanpa silent truncation ~45k char seperti classic.
+AGENTIC = os.environ.get("VENICE_AGENTIC", "1").strip().lower() not in (
     "0", "", "false", "no", "off")
 CHAT_URL = "https://outerface.venice.ai/api/inference/chat"
 AGENT_URL = ("https://outerface.venice.ai/api/inference/chat/agents/venice"
              "?agentModelId=" + MODEL)
+
+_HTTP_TIMEOUT = (15, 120)
 
 _LCC_LOCK = threading.Lock()
 _LCC = [True]
@@ -210,14 +217,14 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
         if lcc_on and len(prompt) >= _LCC_MIN_CHARS:
             body["enableLargeContextChat"] = True
 
-    r = sesi.post(url, headers=hdr, json=body, timeout=(10, 25), stream=True)
+    r = sesi.post(url, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
     try:
         if r.status_code == 400 and body.get("enableLargeContextChat"):
             _tutup_resp(r)
             with _LCC_LOCK:
                 _LCC[0] = False
             body.pop("enableLargeContextChat", None)
-            r = sesi.post(url, headers=hdr, json=body, timeout=(10, 25), stream=True)
+            r = sesi.post(url, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
         if r.status_code in (401, 403):
             try:
                 tok_baru = TOK.get(paksa=True)
@@ -226,7 +233,7 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
             if tok_baru:
                 _tutup_resp(r)
                 hdr["x-venice-client-attestation"] = tok_baru
-                r = sesi.post(url, headers=hdr, json=body, timeout=(10, 25),
+                r = sesi.post(url, headers=hdr, json=body, timeout=_HTTP_TIMEOUT,
                               stream=True)
         if r.status_code != 200:
             try:
@@ -267,14 +274,17 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
                     return False
                 if not isinstance(o, dict):
                     return False
+                if ev in ("response.created", "response.in_progress"):
+                    # Tanda server mulai memproses/prefill prompt besar.
+                    return True
                 if ev == "response.output_item.added":
                     it = o.get("item") or {}
                     if it.get("id") and it.get("type"):
                         tipe_item[it["id"]] = it["type"]
-                    return False
+                    return True
                 if ev == "response.output_text.delta":
                     if tipe_item.get(o.get("item_id") or "") == "reasoning":
-                        return False
+                        return True
                     potong = o.get("delta") or ""
                     if potong:
                         ans += potong
@@ -282,8 +292,9 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
                             on_delta(len(ans) - len(potong), potong)
                         return True
                     return False
-                if ev == "veniceai:tool_call_generation.in_progress":
-                    # Server sedang menghasilkan/mengeksekusi tool; JANGAN putus stream.
+                if ev.startswith("veniceai:"):
+                    # Server sedang menjalankan context_compaction / context_grep /
+                    # tool_call_generation; JANGAN putus stream dan teruskan denyut maju.
                     return True
                 if ev == "response.function_call_arguments.delta":
                     # Argumen partial jangan dibocorkan sebagai teks biasa ke klien;
@@ -439,6 +450,14 @@ def listen(stop, on_msg, topic=None):
             print("mqtt error: %s" % str(e)[:120], flush=True)
         if not stop.is_set():
             time.sleep(1.0)
+
+
+def _baca_prompt(task):
+    """Ekstrak prompt dari payload tugas MQTT (mendukung `prompt_z` zlib+base64)."""
+    pz = task.get("prompt_z")
+    if isinstance(pz, str) and pz:
+        return zlib.decompress(base64.b64decode(pz.encode("ascii"))).decode("utf-8")
+    return task.get("prompt", "")
 
 
 class WorkerRuntime:
@@ -612,8 +631,9 @@ class WorkerRuntime:
             maju[0] += n
 
         try:
+            prompt_teks = _baca_prompt(task)
             ans, status, rem, err = self._ask(
-                task.get("prompt", ""),
+                prompt_teks,
                 on_delta=on_delta,
                 on_maju=catat_maju,
                 stop_check=lambda: self._is_cancelled(tid))
