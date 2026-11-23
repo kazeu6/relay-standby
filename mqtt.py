@@ -1,50 +1,39 @@
-"""Klien MQTT 3.1.1 minimal — tanpa dependensi.
-
-Kenapa file ini ada
-===================
-Bus pesan sebelumnya ntfy.sh. Setelah dipakai beberapa jam, ntfy membalas:
-
-    {"code":42908,"http":429,"error":"limit reached: daily message quota
-     reached; increase your limits with a paid plan"}
-
-Kuota pesan harian habis — dihabiskan detak 15 detik dari tiap worker.
-Begitu itu terjadi, perintah `ask` tidak pernah sampai ke worker, dan
-setiap prompt menggantung sampai timeout 60 detik.
-
-MQTT tidak punya kuota pesan. Broker publik (HiveMQ, mosquitto) menerima
-publish sebanyak apa pun. Jadi bus dipindah ke MQTT.
-
-Kenapa ditulis sendiri: mesin ini tidak punya pip (PEP 668), dan protokol
-yang kita butuh cuma CONNECT / PUBLISH / SUBSCRIBE / PINGREQ — sekitar 150
-baris. Menambah dependensi untuk itu tidak sepadan.
+"""Klien MQTT 3.1.1 minimal — tanpa dependensi, hardened untuk koneksi jangka panjang.
 
 Dipakai oleh `worker.py` (di runner GitHub) dan `pool.py` (di mesin lokal).
+Mendukung CONNECT/CONNACK, PUBLISH (QoS 0), SUBSCRIBE/SUBACK, PINGREQ/PINGRESP,
+deteksi koneksi half-open TCP, batas ukuran paket maksimum, serta penutupan
+socket yang thread-safe.
 """
 import socket
 import ssl
 import struct
 import threading
 import time
+import uuid
 
 CONNECT, CONNACK, PUBLISH, SUBSCRIBE = 1, 2, 3, 8
 SUBACK, PINGREQ, PINGRESP, DISCONNECT = 9, 12, 13, 14
 
+# Batas atas payload satu paket MQTT (16 MiB) untuk mencegah OOM dari frame korup.
+MAX_PACKET_SIZE = 16 * 1024 * 1024
+
 
 def _str(s):
-    b = s.encode()
+    b = s.encode("utf-8")
     return struct.pack("!H", len(b)) + b
 
 
 def _varint(n):
-    out = b""
+    out = bytearray()
     while True:
         d = n % 128
         n //= 128
         if n:
             d |= 0x80
-        out += bytes([d])
+        out.append(d)
         if not n:
-            return out
+            return bytes(out)
 
 
 def _packet(ptype, flags, body):
@@ -56,10 +45,10 @@ class Client:
 
     def __init__(self, host="broker.hivemq.com", port=8883,
                  client_id=None, keepalive=60, tls=True,
-                 username=None, password=None):
+                 username=None, password=None, ping_timeout=None):
         self.host = host
         self.port = port
-        self.client_id = client_id or ("vq" + str(int(time.time() * 1000))[-10:])
+        self.client_id = client_id or ("vq" + uuid.uuid4().hex[:10])
         self.keepalive = keepalive
         self.tls = tls
         self.username = username
@@ -69,76 +58,80 @@ class Client:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self.connected = False
-        # Penyangga baca. WAJIB ada dan WAJIB bertahan antar-panggilan.
-        #
-        # Dulu pembacaan langsung dari socket dengan `_recv_exact(n)` yang
-        # mengumpulkan byte di variabel lokal. Kalau `recv` kena timeout di
-        # TENGAH paket (header sudah terbaca, body belum), pengecualiannya
-        # naik ke `loop` yang memperlakukannya sebagai "tidak ada paket" —
-        # dan byte yang sudah diterima HILANG. Aliran MQTT jadi bergeser
-        # satu paket: byte berikutnya dibaca sebagai tipe paket yang salah.
-        # Gejalanya persis "worker hidup tapi tuli": detak `up` tetap
-        # terkirim (jalur tulis sehat), pool menganggapnya siap, tapi
-        # perintah `ask` tidak pernah sampai sehingga pengelola menunggu
-        # pengakuan lalu melaporkan "tidak mengaku dalam 5s".
         self._buf = b""
+        self._pkt_id = 0
+        self._loop_started = False
+        self._subacks = {}       # pkt_id -> Event
+        self._suback_rc = {}     # pkt_id -> return code byte
+        self._ping_timeout = (float(ping_timeout) if ping_timeout is not None
+                              else min(15.0, max(5.0, float(keepalive) * 0.4)))
 
     # ------------------------------------------------------------- koneksi
     def connect(self, timeout=15):
         s = socket.create_connection((self.host, self.port), timeout=timeout)
-        # Biarkan timeout tetap aktif selama handshake CONNACK. Dulu di sini
-        # langsung `settimeout(None)`, jadi broker yang menerima TCP tetapi
-        # tidak membalas (penuh/diblokir) membuat connect menggantung
-        # selamanya dan worker/pool tidak pernah menyambung ulang.
-        s.settimeout(timeout)
-        if self.tls:
-            # Default port 8883 memakai TLS. Jangan pernah fallback diam-diam
-            # ke 1883: itu mengirim prompt lewat plaintext.
-            s = ssl.create_default_context().wrap_socket(
-                s, server_hostname=self.host)
+        try:
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except OSError:
+                pass
             s.settimeout(timeout)
-        self.sock = s
-        flags = 0x02  # clean session
-        payload = _str(self.client_id)
-        if self.username:
-            flags |= 0x80
-            payload += _str(self.username)
-        if self.password:
-            flags |= 0x40
-            payload += _str(self.password)
-        body = (_str("MQTT") + bytes([4, flags])
-                + struct.pack("!H", self.keepalive) + payload)
-        s.sendall(_packet(CONNECT, 0, body))
-        # CONNACK: 20 02 00 00
-        hdr = self._recv_exact(4)
-        if hdr[0] >> 4 != CONNACK or hdr[3] != 0:
-            raise RuntimeError("CONNACK gagal: %r" % (hdr,))
-        self.connected = True
-        return self
+            if self.tls:
+                # Default port 8883 memakai TLS; jangan fallback ke plaintext.
+                s = ssl.create_default_context().wrap_socket(
+                    s, server_hostname=self.host)
+                s.settimeout(timeout)
+            self.sock = s
+            self._buf = b""
+            self._stop.clear()
+            flags = 0x02  # clean session
+            payload = _str(self.client_id)
+            if self.username:
+                flags |= 0x80
+                payload += _str(self.username)
+            if self.password:
+                flags |= 0x40
+                payload += _str(self.password)
+            body = (_str("MQTT") + bytes([4, flags])
+                    + struct.pack("!H", max(1, int(self.keepalive))) + payload)
+            s.sendall(_packet(CONNECT, 0, body))
+            # CONNACK: 20 02 00 00
+            hdr = self._recv_exact(4, timeout=timeout)
+            if hdr[0] >> 4 != CONNACK or hdr[3] != 0:
+                raise RuntimeError("CONNACK gagal: %r" % (hdr,))
+            self.connected = True
+            return self
+        except Exception:
+            self.connected = False
+            self.sock = None
+            try:
+                s.close()
+            except Exception:
+                pass
+            raise
 
     def _recv_exact(self, n, timeout=None):
         """Ambil tepat `n` byte; sisa yang berlebih disimpan di penyangga."""
+        deadline = (time.monotonic() + timeout) if timeout is not None else None
         while len(self._buf) < n:
+            if deadline is not None:
+                sisa = deadline - time.monotonic()
+                if sisa <= 0:
+                    raise socket.timeout("timeout membaca %d byte MQTT" % n)
+                try:
+                    self.sock.settimeout(sisa)
+                except OSError:
+                    pass
             chunk = self.sock.recv(65536)
             if not chunk:
                 raise ConnectionError("koneksi MQTT ditutup")
             self._buf += chunk
+            if len(self._buf) > MAX_PACKET_SIZE + 16:
+                raise ConnectionError("penyangga MQTT melebihi batas")
         out, self._buf = self._buf[:n], self._buf[n:]
         return out
 
     def _parse(self):
-        """Urai satu paket dari penyangga TANPA memotongnya kalau belum utuh.
-
-        Ini kunci ketahanan pembaca. Dulu pembacaan langsung dari socket:
-        `socket.timeout` di tengah paket membuang byte yang sudah diterima,
-        sehingga aliran MQTT bergeser satu paket dan byte body berikutnya
-        dibaca sebagai header. Gejalanya "worker hidup tapi tuli": detak
-        terkirim, tetapi perintah `ask` tidak pernah sampai.
-
-        Dengan parser ini, timeout tidak menghilangkan apa pun — paket
-        setengah jadi tetap di penyangga dan dilanjutkan pada pembacaan
-        berikutnya.
-        """
+        """Urai satu paket dari penyangga TANPA memotongnya kalau belum utuh."""
         b = self._buf
         if len(b) < 2:
             return None
@@ -154,6 +147,8 @@ class Client:
             mult *= 128
             if mult > 128 ** 3:
                 raise ConnectionError("panjang paket MQTT tidak masuk akal")
+        if val > MAX_PACKET_SIZE:
+            raise ConnectionError("paket MQTT terlalu besar: %d byte" % val)
         total = i + val
         if len(b) < total:
             return None
@@ -170,90 +165,185 @@ class Client:
             if not chunk:
                 raise ConnectionError("koneksi MQTT ditutup")
             self._buf += chunk
+            if len(self._buf) > MAX_PACKET_SIZE + 16:
+                raise ConnectionError("penyangga MQTT melebihi batas")
             p = self._parse()
         return p
+
+    def _dispatch_publish(self, flags, body):
+        if len(body) < 2:
+            raise ConnectionError("paket PUBLISH MQTT terlalu pendek")
+        tlen = struct.unpack("!H", body[:2])[0]
+        qos = (flags >> 1) & 3
+        off = 2 + tlen + (2 if qos else 0)
+        if off > len(body):
+            raise ConnectionError("panjang topic PUBLISH MQTT rusak")
+        topic = body[2:2 + tlen].decode("utf-8", errors="replace")
+        if self.on_message:
+            try:
+                self.on_message(topic, body[off:])
+            except Exception:
+                pass
+
+    def _sendall_locked(self, data):
+        if not self.sock or not self.connected:
+            raise ConnectionError("MQTT tidak tersambung")
+        try:
+            self.sock.sendall(data)
+        except Exception:
+            self.connected = False
+            raise
 
     # ------------------------------------------------------------- kirim
     def publish(self, topic, payload):
         if isinstance(payload, str):
-            payload = payload.encode()
+            payload = payload.encode("utf-8")
+        pkt = _packet(PUBLISH, 0, _str(topic) + payload)
         with self._lock:
-            self.sock.sendall(_packet(PUBLISH, 0, _str(topic) + payload))
+            self._sendall_locked(pkt)
 
-    def subscribe(self, topic, qos=0):
-        body = struct.pack("!H", 1) + _str(topic) + bytes([qos])
+    def subscribe(self, topic, qos=0, timeout=10.0):
         with self._lock:
-            self.sock.sendall(_packet(SUBSCRIBE, 0x02, body))
+            self._pkt_id = (self._pkt_id % 65535) + 1
+            pid = self._pkt_id
+            loop_aktif = self._loop_started
+            ev = threading.Event() if loop_aktif else None
+            if ev is not None:
+                self._subacks[pid] = ev
+            body = struct.pack("!H", pid) + _str(topic) + bytes([qos])
+            try:
+                self._sendall_locked(_packet(SUBSCRIBE, 0x02, body))
+            except Exception:
+                if ev is not None:
+                    self._subacks.pop(pid, None)
+                raise
+
+        if loop_aktif:
+            if not ev.wait(timeout):
+                with self._lock:
+                    self._subacks.pop(pid, None)
+                    self._suback_rc.pop(pid, None)
+                raise TimeoutError("SUBACK timeout untuk topik %s" % topic)
+            with self._lock:
+                self._subacks.pop(pid, None)
+                rc = self._suback_rc.pop(pid, 0x80)
+            if rc == 0x80:
+                raise RuntimeError("SUBACK ditolak broker untuk topik %s" % topic)
+            return
+
+        # Sebelum loop() dijalankan, baca sinkron sampai SUBACK cocok tiba.
+        deadline = time.monotonic() + timeout
+        while True:
+            sisa = deadline - time.monotonic()
+            if sisa <= 0:
+                self.connected = False
+                raise TimeoutError("SUBACK timeout untuk topik %s" % topic)
+            try:
+                self.sock.settimeout(min(2.0, sisa))
+            except OSError:
+                pass
+            try:
+                ptype, flags, body = self._read_packet()
+            except socket.timeout:
+                continue
+            if ptype == SUBACK and len(body) >= 3:
+                rpid = struct.unpack("!H", body[:2])[0]
+                if rpid == pid:
+                    if body[2] == 0x80:
+                        raise RuntimeError("SUBACK ditolak broker untuk topik %s" % topic)
+                    return
+            elif ptype == PUBLISH:
+                self._dispatch_publish(flags, body)
 
     def ping(self):
+        pkt = _packet(PINGREQ, 0, b"")
         with self._lock:
-            self.sock.sendall(_packet(PINGREQ, 0, b""))
+            self._sendall_locked(pkt)
 
     def close(self):
         self._stop.set()
-        try:
-            with self._lock:
-                self.sock.sendall(_packet(DISCONNECT, 0, b""))
-        except Exception:
-            pass
-        try:
-            self.sock.close()
-        except Exception:
-            pass
-        self.connected = False
+        with self._lock:
+            s = self.sock
+            self.sock = None
+            self.connected = False
+            evs = list(self._subacks.values())
+            self._subacks.clear()
+            if s is not None:
+                try:
+                    s.sendall(_packet(DISCONNECT, 0, b""))
+                except Exception:
+                    pass
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        for ev in evs:
+            ev.set()
 
     # ------------------------------------------------------------- terima
     def loop(self):
         """Baca paket sampai koneksi putus. Dipanggil di thread sendiri."""
-        # monotonic: kalau jam dinding mundur, `time.time() - last_ping`
-        # negatif dan PINGREQ tidak pernah terkirim sampai broker memutus.
+        with self._lock:
+            self._loop_started = True
         last_ping = time.monotonic()
+        awaiting_pingresp = False
+        ping_sent_at = 0.0
+        read_to = min(2.0, max(0.1, self._ping_timeout / 3.0))
+
         while not self._stop.is_set():
-            # Timeout baca pendek supaya PINGREQ tetap terkirim walau tidak
-            # ada pesan masuk. Dulu `_recv_exact` memblokir tanpa batas, jadi
-            # saat topik sepi tidak ada PINGREQ sama sekali; broker memutus
-            # koneksi karena keepalive, worker jadi "hidup tapi tuli", dan
-            # pengelola menunggu ack 6 detik x 4 percobaan = 24,8 detik
-            # sebelum menyerah. Itu persis angka DONE 24879ms yang dilaporkan.
+            s = self.sock
+            if s is None or not self.connected:
+                return
             try:
-                self.sock.settimeout(2.0)
+                s.settimeout(read_to)
             except Exception:
                 pass
             try:
                 ptype, flags, body = self._read_packet()
             except socket.timeout:
-                # Tidak ada paket utuh dalam 2 detik. Kalau penyangga masih
-                # berisi potongan paket, JANGAN anggap sepi — lanjut membaca
-                # sisa paketnya di putaran berikutnya. Penyangga membuat
-                # pembacaan bisa dilanjutkan tanpa kehilangan apa pun.
                 ptype = None
             except Exception:
-                self.connected = False
+                self.close()
                 return
 
             if ptype == PUBLISH:
-                tlen = struct.unpack("!H", body[:2])[0]
-                topic = body[2:2 + tlen].decode(errors="replace")
-                # QoS 0 tidak punya packet id; QoS>0 punya 2 byte
-                qos = (flags >> 1) & 3
-                off = 2 + tlen + (2 if qos else 0)
-                if self.on_message:
-                    try:
-                        self.on_message(topic, body[off:])
-                    except Exception:
-                        pass
-            elif ptype in (PINGRESP, CONNACK, SUBACK):
+                try:
+                    self._dispatch_publish(flags, body)
+                except ConnectionError:
+                    self.close()
+                    return
+            elif ptype == PINGRESP:
+                awaiting_pingresp = False
+            elif ptype == SUBACK and len(body) >= 3:
+                rpid = struct.unpack("!H", body[:2])[0]
+                rc = body[2]
+                with self._lock:
+                    self._suback_rc[rpid] = rc
+                    ev = self._subacks.get(rpid)
+                if ev:
+                    ev.set()
+            elif ptype == CONNACK:
                 pass
 
-            if time.monotonic() - last_ping > self.keepalive * 0.6:
+            now = time.monotonic()
+            if awaiting_pingresp and (now - ping_sent_at >= self._ping_timeout):
+                # Koneksi TCP half-open: broker tidak membalas PINGREQ.
+                self.close()
+                return
+
+            if not awaiting_pingresp and (now - last_ping >= self.keepalive * 0.6):
                 try:
                     self.ping()
                 except Exception:
-                    self.connected = False
+                    self.close()
                     return
-                last_ping = time.monotonic()
+                awaiting_pingresp = True
+                ping_sent_at = now
+                last_ping = now
 
     def start(self):
+        with self._lock:
+            self._loop_started = True
         t = threading.Thread(target=self.loop, daemon=True)
         t.start()
         return t
