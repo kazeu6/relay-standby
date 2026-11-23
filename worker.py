@@ -47,7 +47,7 @@ MQTT_TLS = os.environ.get("MQTT_TLS", "1").strip().lower() not in (
 MQTT_USER = os.environ.get("MQTT_USER") or None
 MQTT_PASS = os.environ.get("MQTT_PASS") or None
 WID = uuid.uuid4().hex[:8]
-VER_WORKER = "18"
+VER_WORKER = "19"
 
 _BUS = [None]
 _KIRIM = []
@@ -172,8 +172,9 @@ _LCC_LOCK = threading.Lock()
 _LCC = [True]
 _LCC_MIN_CHARS = 66000
 _ISFILE_MIN_CHARS = 40000
+_ISFILE_HIST_MIN = 16000
 _TAIL_USER_MAX = 35000
-_SYS_MAX_CHARS = 32000
+_SYS_MAX_CHARS = 120000
 _MAX_RESP_DEFAULT = int(os.environ.get("VENICE_MAX_RESP_TOKENS", "131072"))
 _SEP_PERCAKAPAN = "\n\n===== PERCAKAPAN =====\n\n"
 
@@ -190,8 +191,66 @@ def _opsi_reasoning(opts=None):
     return True
 
 
+def _susun_turns_classic(turns):
+    """Ubah daftar `turns` OpenAI-like menjadi `(system_prompt, prompt_array)` natif Classic.
+
+    - Memisahkan pesan `system` pembuka ke `systemPrompt`; penanda `system`
+      di tengah/ekor (seperti ringkasan compaction / anchor / peta) tetap pada
+      posisinya sebagai konteks `user` agar urutan kronologis & recency terjaga.
+    - Menggabungkan pesan berurutan dengan role sama (identik dengan klien web Venice).
+    - Menandai `isFile: True` secara selektif hanya pada pesan besar agar pesan
+      `user`/`assistant` normal memakai chat template asli DeepSeek V4.1.
+    """
+    sys_parts = []
+    conv = []
+    mulai_conv = False
+    for m in turns or []:
+        if not isinstance(m, dict):
+            continue
+        role = (m.get("role") or "user").strip().lower()
+        content = m.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if role == "system" and not mulai_conv:
+            sys_parts.append(content.strip())
+            continue
+        mulai_conv = True
+        if role not in ("user", "assistant"):
+            role = "user"
+        if conv and conv[-1]["role"] == role:
+            conv[-1]["content"] += "\n\n" + content
+        else:
+            conv.append({"role": role, "content": content})
+
+    if not any(x["role"] == "user" for x in conv):
+        conv.append({"role": "user", "content": "Lanjutkan sesuai instruksi sistem."})
+
+    total_conv = sum(len(x["content"]) for x in conv)
+    last_idx = len(conv) - 1
+    out = []
+    for idx, x in enumerate(conv):
+        item = {"role": x["role"], "content": x["content"]}
+        n_c = len(x["content"])
+        if x["role"] == "user":
+            if n_c >= _ISFILE_MIN_CHARS or (
+                total_conv >= _ISFILE_MIN_CHARS and idx < last_idx and n_c >= _ISFILE_HIST_MIN
+            ):
+                item["isFile"] = True
+        out.append(item)
+
+    if out and out[-1].get("isFile"):
+        out.append({
+            "role": "user",
+            "content": (
+                "Lanjutkan percakapan di atas dan balas langsung sebagai "
+                "Assistant sesuai instruksi sistem."
+            ),
+        })
+    return "\n\n".join(sys_parts).strip(), out
+
+
 def _classic_body(prompt, lcc_on=True, opts=None):
-    """Bangun body Classic `/api/inference/chat` tanpa truncation hingga 1M char."""
+    """Bangun body Classic `/api/inference/chat` (native multi-turn + anti-truncation hingga 1M char)."""
     opts = opts if isinstance(opts, dict) else {}
     body = {
         "modelId": MODEL,
@@ -215,6 +274,22 @@ def _classic_body(prompt, lcc_on=True, opts=None):
     tp = opts.get("top_p")
     if isinstance(tp, (int, float)) and not isinstance(tp, bool) and 0.0 < float(tp) <= 1.0:
         body["topP"] = float(tp)
+
+    turns = opts.get("turns")
+    if isinstance(turns, list) and turns:
+        sys_txt, p_arr = _susun_turns_classic(turns)
+        if sys_txt:
+            if len(sys_txt) <= _SYS_MAX_CHARS:
+                body["systemPrompt"] = sys_txt
+            else:
+                p_arr.insert(0, {"role": "user", "content": sys_txt, "isFile": True})
+        body["prompt"] = p_arr
+        total_len = len(body.get("systemPrompt") or "") + sum(
+            len(x.get("content") or "") for x in p_arr
+        )
+        if lcc_on and total_len >= _LCC_MIN_CHARS:
+            body["enableLargeContextChat"] = True
+        return body
 
     isi = prompt or ""
     if _SEP_PERCAKAPAN in isi:
@@ -276,6 +351,12 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None, opts=None):
             with _LCC_LOCK:
                 _LCC[0] = False
             body.pop("enableLargeContextChat", None)
+            r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
+        if r.status_code == 400 and len(body.get("systemPrompt") or "") > 32000:
+            _tutup_resp(r)
+            sp = body.pop("systemPrompt", "")
+            if sp:
+                body["prompt"] = [{"role": "user", "content": sp, "isFile": True}] + list(body.get("prompt") or [])
             r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
         if r.status_code == 400 and any(k in body for k in ("maxResponseTokens", "temperature", "topP")):
             _tutup_resp(r)
@@ -459,6 +540,20 @@ def _baca_prompt(task):
     return task.get("prompt", "")
 
 
+def _baca_turns(task):
+    """Ekstrak daftar `turns` natif dari payload tugas MQTT (`turns_z` atau `turns`)."""
+    tz = task.get("turns_z")
+    if isinstance(tz, str) and tz:
+        try:
+            data = json.loads(zlib.decompress(base64.b64decode(tz.encode("ascii"))).decode("utf-8"))
+            if isinstance(data, list):
+                return data
+        except Exception:
+            return None
+    t = task.get("turns")
+    return t if isinstance(t, list) else None
+
+
 class WorkerRuntime:
     """State dan dispatcher pesan untuk satu instance worker."""
 
@@ -631,13 +726,16 @@ class WorkerRuntime:
 
         try:
             prompt_teks = _baca_prompt(task)
-            task_opts = task.get("opts") if isinstance(task.get("opts"), dict) else None
+            task_opts = dict(task["opts"]) if isinstance(task.get("opts"), dict) else {}
+            turns = _baca_turns(task)
+            if turns:
+                task_opts["turns"] = turns
             ans, status, rem, err = self._ask(
                 prompt_teks,
                 on_delta=on_delta,
                 on_maju=catat_maju,
                 stop_check=lambda: self._is_cancelled(tid),
-                opts=task_opts)
+                opts=task_opts or None)
         except Exception as e:
             nadi_stop.set()
             with self.kunci:
