@@ -33,10 +33,11 @@ jobs:
           # Nama repo diambil dari konteks, bukan ditulis di sini: kalau repo
           # diganti nama, workflow ini tidak perlu diubah.
           #
-          # `?rev=` penting: raw.githubusercontent.com di-cache ~5 menit, jadi
-          # tanpa ini proses bisa memakai versi lama beberapa menit setelah push.
-          R=${{ github.run_id }}
-          B="https://raw.githubusercontent.com/${{ github.repository }}/main"
-          curl -sS -m 30 -o /tmp/worker.py "$B/worker.py?rev=$R"
-          curl -sS -m 30 -o /tmp/mqtt.py "$B/mqtt.py?rev=$R"
+          # Pakai commit SHA eksplisit (${{ github.sha }}), BUKAN `/main?rev=...`:
+          # CDN raw.githubusercontent.com mengabaikan query string dan meng-cache
+          # `/main` hingga ~5 menit setelah push, sehingga worker baru bisa menarik
+          # versi lama. SHA bersifat immutable dan langsung segar saat push.
+          B="https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}"
+          curl -sS -m 30 -o /tmp/worker.py "$B/worker.py"
+          curl -sS -m 30 -o /tmp/mqtt.py "$B/mqtt.py"
           python3 /tmp/worker.py
