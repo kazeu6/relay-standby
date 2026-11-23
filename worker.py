@@ -47,7 +47,7 @@ MQTT_TLS = os.environ.get("MQTT_TLS", "1").strip().lower() not in (
 MQTT_USER = os.environ.get("MQTT_USER") or None
 MQTT_PASS = os.environ.get("MQTT_PASS") or None
 WID = uuid.uuid4().hex[:8]
-VER_WORKER = "17"
+VER_WORKER = "18"
 
 _BUS = [None]
 _KIRIM = []
@@ -172,22 +172,27 @@ _LCC_LOCK = threading.Lock()
 _LCC = [True]
 _LCC_MIN_CHARS = 66000
 _ISFILE_MIN_CHARS = 40000
+_TAIL_USER_MAX = 35000
 _SYS_MAX_CHARS = 32000
+_MAX_RESP_DEFAULT = int(os.environ.get("VENICE_MAX_RESP_TOKENS", "131072"))
 _SEP_PERCAKAPAN = "\n\n===== PERCAKAPAN =====\n\n"
 
 
-def _opsi_reasoning():
-    """Baca env `VENICE_REASONING` (`"0"` -> False, `"1"` -> True, kosong -> default server)."""
-    v = os.environ.get("VENICE_REASONING", "").strip().lower()
+def _opsi_reasoning(opts=None):
+    """Tentukan flag `reasoning` (per-request opts > env `VENICE_REASONING` > default True)."""
+    if isinstance(opts, dict) and isinstance(opts.get("reasoning"), bool):
+        return opts["reasoning"]
+    v = os.environ.get("VENICE_REASONING", "1").strip().lower()
     if v in ("0", "false", "no", "off"):
         return False
     if v in ("1", "true", "ya", "yes", "on"):
         return True
-    return None
+    return True
 
 
-def _classic_body(prompt, lcc_on=True):
+def _classic_body(prompt, lcc_on=True, opts=None):
     """Bangun body Classic `/api/inference/chat` tanpa truncation hingga 1M char."""
+    opts = opts if isinstance(opts, dict) else {}
     body = {
         "modelId": MODEL,
         "requestId": str(uuid.uuid4()),
@@ -195,10 +200,21 @@ def _classic_body(prompt, lcc_on=True):
         "webEnabled": False,
         "webScrapeEnabled": False,
         "xSearchEnabled": False,
+        "reasoning": _opsi_reasoning(opts),
     }
-    reas = _opsi_reasoning()
-    if reas is not None:
-        body["reasoning"] = reas
+
+    mt = opts.get("max_tokens")
+    if isinstance(mt, int) and not isinstance(mt, bool) and mt > 0:
+        body["maxResponseTokens"] = min(mt, _MAX_RESP_DEFAULT)
+    elif _MAX_RESP_DEFAULT > 0:
+        body["maxResponseTokens"] = _MAX_RESP_DEFAULT
+
+    temp = opts.get("temperature")
+    if isinstance(temp, (int, float)) and not isinstance(temp, bool) and 0.0 <= float(temp) <= 2.0:
+        body["temperature"] = float(temp)
+    tp = opts.get("top_p")
+    if isinstance(tp, (int, float)) and not isinstance(tp, bool) and 0.0 < float(tp) <= 1.0:
+        body["topP"] = float(tp)
 
     isi = prompt or ""
     if _SEP_PERCAKAPAN in isi:
@@ -208,13 +224,22 @@ def _classic_body(prompt, lcc_on=True):
             isi = ekor
 
     if len(isi) >= _ISFILE_MIN_CHARS:
-        body["prompt"] = [
-            {"role": "user", "content": isi, "isFile": True},
-            {"role": "user", "content": (
-                "Lanjutkan percakapan di atas dan balas langsung sebagai "
-                "Assistant sesuai instruksi sistem."
-            )},
-        ]
+        idx_u = isi.rfind("\n\nUser: ")
+        if idx_u >= 1000 and (len(isi) - idx_u) < _TAIL_USER_MAX:
+            hist = isi[:idx_u]
+            tail = isi[idx_u + 2:]
+            body["prompt"] = [
+                {"role": "user", "content": hist, "isFile": True},
+                {"role": "user", "content": tail},
+            ]
+        else:
+            body["prompt"] = [
+                {"role": "user", "content": isi, "isFile": True},
+                {"role": "user", "content": (
+                    "Lanjutkan percakapan di atas dan balas langsung sebagai "
+                    "Assistant sesuai instruksi sistem."
+                )},
+            ]
     else:
         body["prompt"] = [{"role": "user", "content": isi}]
 
@@ -231,7 +256,7 @@ def _tutup_resp(r):
             pass
 
 
-def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
+def ask(prompt, on_delta=None, on_maju=None, stop_check=None, opts=None):
     """Satu chat murni lewat Classic `/api/inference/chat`. Kembalikan (jawaban, status, sisa_kuota, err)."""
     sesi = _session()
     hdr = {**H, "accept": "text/event-stream",
@@ -242,7 +267,7 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
            "x-venice-version": VER}
     with _LCC_LOCK:
         lcc_on = _LCC[0]
-    body = _classic_body(prompt, lcc_on=lcc_on)
+    body = _classic_body(prompt, lcc_on=lcc_on, opts=opts)
 
     r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
     try:
@@ -251,6 +276,11 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
             with _LCC_LOCK:
                 _LCC[0] = False
             body.pop("enableLargeContextChat", None)
+            r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
+        if r.status_code == 400 and any(k in body for k in ("maxResponseTokens", "temperature", "topP")):
+            _tutup_resp(r)
+            for k in ("maxResponseTokens", "temperature", "topP"):
+                body.pop(k, None)
             r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
         if r.status_code in (401, 403):
             try:
@@ -284,7 +314,7 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
                 on_delta(len(ans) - len(potong), potong)
 
         def proses(ln):
-            """Urai satu baris NDJSON Classic. Kembalikan True kalau ada kemajuan nyata."""
+            """Urai satu baris NDJSON Classic (termasuk `reasoning_content`). Kembalikan True kalau ada kemajuan nyata."""
             nonlocal cadangan
             try:
                 o = json.loads(ln)
@@ -295,7 +325,7 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
             k = o.get("kind") or "(tanpa kind)"
             jenis[k] = jenis.get(k, 0) + 1
             if k in ("reasoning", "thinking"):
-                potong = o.get("content") or o.get("reasoning") or o.get("thinking") or ""
+                potong = o.get("content") or o.get("reasoning_content") or o.get("reasoning") or o.get("thinking") or ""
                 if potong:
                     cadangan += potong
                     if not dalam_think[0]:
@@ -305,16 +335,26 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
                     return True
                 return False
             if k == "content":
+                # Venice Classic mengirim penalaran pada field `reasoning_content` di dalam `kind="content"`.
+                rc = o.get("reasoning_content")
                 potong = o.get("content") or ""
+                maju = False
+                if isinstance(rc, str) and rc:
+                    cadangan += rc
+                    if not dalam_think[0]:
+                        dalam_think[0] = True
+                        emit("<think>")
+                    emit(rc)
+                    maju = True
                 if potong:
                     if dalam_think[0]:
                         dalam_think[0] = False
                         emit("</think>")
                     emit(potong)
-                    return True
-                return False
+                    maju = True
+                return maju
             potong = ""
-            for f in ("content", "text", "reasoning", "thinking", "delta"):
+            for f in ("content", "text", "reasoning_content", "reasoning", "thinking", "delta"):
                 v = o.get(f)
                 if isinstance(v, str) and v:
                     potong += v
@@ -354,10 +394,10 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
         _tutup_resp(r)
 
 
-def ask_ulang(prompt, coba=2, on_delta=None, on_maju=None, stop_check=None):
+def ask_ulang(prompt, coba=2, on_delta=None, on_maju=None, stop_check=None, opts=None):
     """`ask` dengan percobaan ulang kalau balasannya kosong."""
     ans, status, rem, err = ask(prompt, on_delta=on_delta,
-                                on_maju=on_maju, stop_check=stop_check)
+                                on_maju=on_maju, stop_check=stop_check, opts=opts)
     for _ in range(coba):
         if ans or status != 200 or (stop_check and stop_check()):
             break
@@ -365,7 +405,7 @@ def ask_ulang(prompt, coba=2, on_delta=None, on_maju=None, stop_check=None):
         if on_delta:
             on_delta(-1, "")
         ans, status, rem, err = ask(prompt, on_delta=on_delta,
-                                    on_maju=on_maju, stop_check=stop_check)
+                                    on_maju=on_maju, stop_check=stop_check, opts=opts)
     return ans, status, rem, err
 
 
@@ -591,11 +631,13 @@ class WorkerRuntime:
 
         try:
             prompt_teks = _baca_prompt(task)
+            task_opts = task.get("opts") if isinstance(task.get("opts"), dict) else None
             ans, status, rem, err = self._ask(
                 prompt_teks,
                 on_delta=on_delta,
                 on_maju=catat_maju,
-                stop_check=lambda: self._is_cancelled(tid))
+                stop_check=lambda: self._is_cancelled(tid),
+                opts=task_opts)
         except Exception as e:
             nadi_stop.set()
             with self.kunci:
