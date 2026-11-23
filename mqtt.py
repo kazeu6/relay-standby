@@ -21,6 +21,7 @@ baris. Menambah dependensi untuk itu tidak sepadan.
 Dipakai oleh `worker.py` (di runner GitHub) dan `pool.py` (di mesin lokal).
 """
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -53,12 +54,16 @@ def _packet(ptype, flags, body):
 class Client:
     """Satu koneksi MQTT. `on_message(topic, payload_bytes)` dipanggil di thread pembaca."""
 
-    def __init__(self, host="broker.hivemq.com", port=1883,
-                 client_id=None, keepalive=60):
+    def __init__(self, host="broker.hivemq.com", port=8883,
+                 client_id=None, keepalive=60, tls=True,
+                 username=None, password=None):
         self.host = host
         self.port = port
         self.client_id = client_id or ("vq" + str(int(time.time() * 1000))[-10:])
         self.keepalive = keepalive
+        self.tls = tls
+        self.username = username
+        self.password = password
         self.sock = None
         self.on_message = None
         self._stop = threading.Event()
@@ -86,9 +91,23 @@ class Client:
         # tidak membalas (penuh/diblokir) membuat connect menggantung
         # selamanya dan worker/pool tidak pernah menyambung ulang.
         s.settimeout(timeout)
+        if self.tls:
+            # Default port 8883 memakai TLS. Jangan pernah fallback diam-diam
+            # ke 1883: itu mengirim prompt lewat plaintext.
+            s = ssl.create_default_context().wrap_socket(
+                s, server_hostname=self.host)
+            s.settimeout(timeout)
         self.sock = s
-        body = _str("MQTT") + bytes([4, 0x02]) + struct.pack("!H", self.keepalive)
-        body += _str(self.client_id)
+        flags = 0x02  # clean session
+        payload = _str(self.client_id)
+        if self.username:
+            flags |= 0x80
+            payload += _str(self.username)
+        if self.password:
+            flags |= 0x40
+            payload += _str(self.password)
+        body = (_str("MQTT") + bytes([4, flags])
+                + struct.pack("!H", self.keepalive) + payload)
         s.sendall(_packet(CONNECT, 0, body))
         # CONNACK: 20 02 00 00
         hdr = self._recv_exact(4)
@@ -240,9 +259,11 @@ class Client:
         return t
 
 
-def make(on_message=None, host="broker.hivemq.com", port=1883, client_id=None):
+def make(on_message=None, host="broker.hivemq.com", port=8883, client_id=None,
+         tls=True, username=None, password=None):
     """Buat klien yang sudah tersambung (belum subscribe)."""
-    c = Client(host=host, port=port, client_id=client_id)
+    c = Client(host=host, port=port, client_id=client_id, tls=tls,
+               username=username, password=password)
     c.on_message = on_message
     c.connect()
     return c

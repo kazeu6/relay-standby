@@ -53,14 +53,18 @@ POOL = os.environ.get("POOL") or (TOPIC + "-p")
 IDLE = int(os.environ.get("IDLE", "600"))
 CAP = int(os.environ.get("CAP", "8"))
 MQTT_HOST = os.environ.get("MQTT_HOST", "broker.hivemq.com")
-MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
+MQTT_TLS = os.environ.get("MQTT_TLS", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
+MQTT_USER = os.environ.get("MQTT_USER") or None
+MQTT_PASS = os.environ.get("MQTT_PASS") or None
 WID = uuid.uuid4().hex[:8]
 # Versi kode worker. Dinaikkan setiap kali ada perubahan yang HARUS dipakai
 # semua worker. Pool menolak worker dengan versi lebih rendah, karena worker
 # lama yang masih hidup bisa membuat pool mengirim tugas ke kode yang sudah
 # tidak cocok — gejalanya 502 acak dan latensi 12-31 detik pada permintaan
 # pertama setelah deploy.
-VER_WORKER = "12"
+VER_WORKER = "13"
 _BUS = [None]          # klien MQTT untuk publish, diisi oleh listen()
 # Antrean kirim. WAJIB: `publish` dipanggil dari dalam `on_msg`, yaitu
 # thread PEMBACA mqtt. Dulu jalur cadangan di `publish` membuka koneksi baru
@@ -135,7 +139,9 @@ def _pengirim(stop):
                 pass
         try:
             t = mqtt.Client(host=MQTT_HOST, port=MQTT_PORT,
-                            client_id="wx" + uuid.uuid4().hex[:8])
+                            client_id="wx" + uuid.uuid4().hex[:8],
+                            tls=MQTT_TLS, username=MQTT_USER,
+                            password=MQTT_PASS)
             t.connect(timeout=5)
             t.publish(topic, data)
             t.close()
@@ -196,6 +202,13 @@ AGENT_URL = ("https://outerface.venice.ai/api/inference/chat/agents/venice"
              "?agentModelId=" + MODEL)
 
 
+# Jalur classic membatasi konteks ke 50K/25K token kecuali `enableLargeContextChat`
+# dikirim. Tanpa opt-in ini prompt panjang (>=66k char) menggantung. Dimatikan
+# otomatis kalau server membalas 400 (server lama tidak mengenal field ini).
+_LCC = [True]
+_LCC_MIN_CHARS = 66000
+
+
 def _agentic_body(prompt):
     """Body agentic: `content` WAJIB array parts, bukan string (kalau string: 500)."""
     return {"input": {"messages": [{
@@ -244,7 +257,15 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None):
         url, body = CHAT_URL, {"modelId": MODEL,
                                "prompt": [{"role": "user", "content": prompt}],
                                "requestId": str(uuid.uuid4())}
+        if _LCC[0] and len(prompt) >= _LCC_MIN_CHARS:
+            body["enableLargeContextChat"] = True
     r = S.post(url, headers=hdr, json=body, timeout=(10, 25), stream=True)
+    if (r.status_code == 400 and body.get("enableLargeContextChat")):
+        # Server menolak field opt-in: matikan global supaya tidak dicoba lagi
+        # di setiap permintaan panjang, lalu ulangi tanpa field itu.
+        _LCC[0] = False
+        body.pop("enableLargeContextChat", None)
+        r = S.post(url, headers=hdr, json=body, timeout=(10, 25), stream=True)
     if r.status_code in (401, 403):
         # Token basi: paksa mint token baru, lalu ulangi sekali.
         try:
@@ -452,7 +473,8 @@ def listen(stop, on_msg):
     while not stop.is_set():
         try:
             c = mqtt.Client(host=MQTT_HOST, port=MQTT_PORT,
-                            client_id="vw" + WID)
+                            client_id="vw" + WID, tls=MQTT_TLS,
+                            username=MQTT_USER, password=MQTT_PASS)
 
             def cb(topic, payload):
                 if stop.is_set():
