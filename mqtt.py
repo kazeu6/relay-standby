@@ -1,11 +1,18 @@
 """Klien MQTT 3.1.1 minimal — tanpa dependensi, hardened untuk koneksi jangka panjang.
 
 Dipakai oleh `worker.py` (di runner GitHub) dan `pool.py` (di mesin lokal).
-Mendukung CONNECT/CONNACK, PUBLISH (QoS 0), SUBSCRIBE/SUBACK, PINGREQ/PINGRESP,
-deteksi koneksi half-open TCP, batas ukuran paket maksimum, serta penutupan
-socket yang thread-safe.
+Mendukung CONNECT/CONNACK, PUBLISH (QoS 0/1 PUBACK), SUBSCRIBE/SUBACK,
+PINGREQ/PINGRESP, deteksi koneksi half-open TCP, batas ukuran paket maksimum,
+`selectors` tanpa batas 1024 FD, enkripsi AEAD Encrypt-then-MAC (`seal_frame` /
+`open_frame` + `ReplayGuard`), serta penutupan socket yang thread-safe.
 """
-import select
+import base64
+import hashlib
+import hmac
+import json
+import math
+import secrets
+import selectors
 import socket
 import ssl
 import struct
@@ -13,11 +20,114 @@ import threading
 import time
 import uuid
 
-CONNECT, CONNACK, PUBLISH, SUBSCRIBE = 1, 2, 3, 8
+CONNECT, CONNACK, PUBLISH, PUBACK, SUBSCRIBE = 1, 2, 3, 4, 8
 SUBACK, PINGREQ, PINGRESP, DISCONNECT = 9, 12, 13, 14
 
 # Batas atas payload satu paket MQTT (16 MiB) untuk mencegah OOM dari frame korup.
 MAX_PACKET_SIZE = 16 * 1024 * 1024
+
+
+# ------------------------------------------------ autentikasi & enkripsi frame
+def _stream_xor(key_b, nonce, data):
+    """Stream cipher CTR berbasis HMAC-SHA256 + SHA-256 (stdlib murni)."""
+    if not data:
+        return b""
+    enc_key = hmac.new(key_b, b"venice-enc-v1:" + nonce, hashlib.sha256).digest()
+    n = len(data)
+    blocks = (n + 31) // 32
+    ks = b"".join(
+        hashlib.sha256(enc_key + struct.pack("!Q", i)).digest()
+        for i in range(blocks)
+    )[:n]
+    x = int.from_bytes(data, "big") ^ int.from_bytes(ks, "big")
+    return x.to_bytes(n, "big")
+
+
+class ReplayGuard:
+    """Pelindung replay nonce berbatas TTL & ukuran memori (thread-safe)."""
+
+    def __init__(self, ttl=240.0, max_size=8192):
+        self.ttl = float(ttl)
+        self.max_size = int(max_size)
+        self._seen = {}
+        self._lock = threading.Lock()
+
+    def check_and_add(self, nonce_bytes):
+        """True jika nonce baru (sah); False jika replay/duplikat."""
+        now = time.monotonic()
+        with self._lock:
+            if len(self._seen) >= self.max_size:
+                for k in [k for k, exp in list(self._seen.items()) if exp <= now]:
+                    self._seen.pop(k, None)
+                kelebihan = len(self._seen) - self.max_size + 1
+                if kelebihan > 0:
+                    for k in sorted(list(self._seen),
+                                    key=lambda x: self._seen.get(x, 0))[:kelebihan]:
+                        self._seen.pop(k, None)
+            exp = self._seen.get(nonce_bytes)
+            if exp is not None and exp > now:
+                return False
+            self._seen[nonce_bytes] = now + self.ttl
+            return True
+
+
+def seal_frame(key, topic, payload):
+    """Bungkus payload JSON/str ke amplop terenkripsi + HMAC-SHA256 (Encrypt-then-MAC)."""
+    key_b = key.encode("utf-8") if isinstance(key, str) else bytes(key)
+    if isinstance(payload, bytes):
+        pt = payload
+    elif isinstance(payload, str):
+        pt = payload.encode("utf-8")
+    else:
+        pt = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    nonce = secrets.token_bytes(16)
+    ts_ms = int(time.time() * 1000)
+    ct = _stream_xor(key_b, nonce, pt)
+    mac_key = hmac.new(key_b, b"venice-mac-v1:" + nonce, hashlib.sha256).digest()
+    aad = ("v1|%s|%d|" % (topic or "", ts_ms)).encode("utf-8")
+    tag = hmac.new(mac_key, aad + nonce + b"|" + ct, hashlib.sha256).digest()
+    return json.dumps({
+        "enc": "v1",
+        "n": base64.b64encode(nonce).decode("ascii"),
+        "ts": ts_ms,
+        "ct": base64.b64encode(ct).decode("ascii"),
+        "mac": base64.b64encode(tag).decode("ascii"),
+    }, separators=(",", ":"))
+
+
+def open_frame(key, topic, raw_msg, replay_guard=None, max_skew_s=120.0):
+    """Verifikasi HMAC + kesegaran timestamp + anti-replay, lalu dekripsi frame."""
+    key_b = key.encode("utf-8") if isinstance(key, str) else bytes(key)
+    if isinstance(raw_msg, bytes):
+        raw_msg = raw_msg.decode("utf-8", "replace")
+    try:
+        env = json.loads(raw_msg)
+    except Exception:
+        raise ValueError("frame MQTT bukan JSON valid")
+    if not isinstance(env, dict) or env.get("enc") != "v1":
+        raise ValueError("frame MQTT tidak terenkripsi (wajib enc=v1)")
+    ts_ms = env.get("ts")
+    if isinstance(ts_ms, bool) or not isinstance(ts_ms, (int, float)) or not math.isfinite(float(ts_ms)):
+        raise ValueError("timestamp frame tidak valid")
+    if abs(time.time() * 1000.0 - float(ts_ms)) > float(max_skew_s) * 1000.0:
+        raise ValueError("timestamp frame di luar jendela toleransi")
+    try:
+        nonce = base64.b64decode(env["n"].encode("ascii"), validate=True)
+        ct = base64.b64decode(env["ct"].encode("ascii"), validate=True)
+        tag = base64.b64decode(env["mac"].encode("ascii"), validate=True)
+    except Exception:
+        raise ValueError("encoding amplop frame rusak")
+    if len(nonce) != 16 or len(tag) != 32:
+        raise ValueError("panjang nonce/mac frame tidak valid")
+    mac_key = hmac.new(key_b, b"venice-mac-v1:" + nonce, hashlib.sha256).digest()
+    aad = ("v1|%s|%d|" % (topic or "", int(ts_ms))).encode("utf-8")
+    expected = hmac.new(mac_key, aad + nonce + b"|" + ct, hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, tag):
+        raise ValueError("tanda tangan HMAC frame tidak cocok")
+    if replay_guard is not None and not replay_guard.check_and_add(nonce):
+        raise ValueError("frame MQTT replay terdeteksi")
+    pt = _stream_xor(key_b, nonce, ct)
+    return pt.decode("utf-8")
 
 
 def _str(s):
@@ -52,6 +162,8 @@ class Client:
         self.client_id = client_id or ("vq" + uuid.uuid4().hex[:10])
         self.keepalive = keepalive
         self.tls = tls
+        if password and not username:
+            raise ValueError("MQTT 3.1.1 melarang password tanpa username")
         self.username = username
         self.password = password
         self.sock = None
@@ -84,6 +196,10 @@ class Client:
             self.sock = s
             self._buf = b""
             self._stop.clear()
+            with self._lock:
+                self._loop_started = False
+                self._subacks.clear()
+                self._suback_rc.clear()
             flags = 0x02  # clean session
             payload = _str(self.client_id)
             if self.username:
@@ -163,47 +279,65 @@ class Client:
 
         Pada CPython/OpenSSL, `SSLSocket.recv()` dan `SSLSocket.sendall()` tidak
         aman/saling mengunci bila berjalan serentak dari dua thread. Memakai
-        `select.select()` di luar `_lock` lalu membaca singkat di dalam `_lock`
-        menghilangkan stall 2-4 detik dan menjaga mutual exclusion OpenSSL.
+        `selectors.DefaultSelector()` di luar `_lock` (bebas limit 1024 FD
+        `select.select()`) lalu membaca singkat di dalam `_lock` guna menjaga
+        mutual exclusion OpenSSL.
         """
         p = self._parse()
         if p is not None:
             return p
         deadline = time.monotonic() + max(0.05, float(timeout))
-        while p is None:
-            if self._stop.is_set():
-                raise ConnectionError("MQTT dihentikan")
-            with self._lock:
-                s = self.sock
-                if s is None or not self.connected:
+        sel = selectors.DefaultSelector()
+        reg_sock = None
+        try:
+            while p is None:
+                if self._stop.is_set():
+                    raise ConnectionError("MQTT dihentikan")
+                with self._lock:
+                    s = self.sock
+                    if s is None or not self.connected:
+                        raise ConnectionError("koneksi MQTT ditutup")
+                    has_pending = getattr(s, "pending", lambda: 0)() > 0
+                if not has_pending:
+                    sisa = deadline - time.monotonic()
+                    if sisa <= 0:
+                        raise socket.timeout("belum ada paket MQTT")
+                    try:
+                        if reg_sock is not s:
+                            if reg_sock is not None:
+                                try:
+                                    sel.unregister(reg_sock)
+                                except Exception:
+                                    pass
+                            sel.register(s, selectors.EVENT_READ)
+                            reg_sock = s
+                        ready = sel.select(min(0.05, sisa))
+                    except (OSError, ValueError):
+                        raise ConnectionError("socket MQTT ditutup")
+                    if not ready:
+                        continue
+                with self._lock:
+                    s = self.sock
+                    if s is None or not self.connected:
+                        raise ConnectionError("koneksi MQTT ditutup")
+                    try:
+                        s.settimeout(0.25)
+                        chunk = s.recv(65536)
+                    except (socket.timeout, ssl.SSLWantReadError,
+                            ssl.SSLWantWriteError, BlockingIOError):
+                        continue
+                if not chunk:
                     raise ConnectionError("koneksi MQTT ditutup")
-                has_pending = getattr(s, "pending", lambda: 0)() > 0
-            if not has_pending:
-                sisa = deadline - time.monotonic()
-                if sisa <= 0:
-                    raise socket.timeout("belum ada paket MQTT")
-                try:
-                    ready, _, _ = select.select([s], [], [], min(0.05, sisa))
-                except (OSError, ValueError):
-                    raise ConnectionError("socket MQTT ditutup")
-                if not ready:
-                    continue
-            with self._lock:
-                s = self.sock
-                if s is None or not self.connected:
-                    raise ConnectionError("koneksi MQTT ditutup")
-                try:
-                    s.settimeout(0.25)
-                    chunk = s.recv(65536)
-                except (socket.timeout, ssl.SSLWantReadError):
-                    continue
-            if not chunk:
-                raise ConnectionError("koneksi MQTT ditutup")
-            self._buf += chunk
-            if len(self._buf) > MAX_PACKET_SIZE + 16:
-                raise ConnectionError("penyangga MQTT melebihi batas")
-            p = self._parse()
-        return p
+                self._buf += chunk
+                if len(self._buf) > MAX_PACKET_SIZE + 16:
+                    raise ConnectionError("penyangga MQTT melebihi batas")
+                p = self._parse()
+            return p
+        finally:
+            try:
+                sel.close()
+            except Exception:
+                pass
 
     def _dispatch_publish(self, flags, body):
         if len(body) < 2:
@@ -213,6 +347,13 @@ class Client:
         off = 2 + tlen + (2 if qos else 0)
         if off > len(body):
             raise ConnectionError("panjang topic PUBLISH MQTT rusak")
+        if qos == 1:
+            pkt_id = struct.unpack("!H", body[2 + tlen:2 + tlen + 2])[0]
+            try:
+                with self._lock:
+                    self._sendall_locked(_packet(PUBACK, 0, struct.pack("!H", pkt_id)))
+            except Exception:
+                pass
         topic = body[2:2 + tlen].decode("utf-8", errors="replace")
         if self.on_message:
             try:
@@ -301,8 +442,10 @@ class Client:
             self.connected = False
             evs = list(self._subacks.values())
             self._subacks.clear()
+            self._suback_rc.clear()
             if s is not None:
                 try:
+                    s.settimeout(0.5)
                     s.sendall(_packet(DISCONNECT, 0, b""))
                 except Exception:
                     pass
@@ -349,6 +492,8 @@ class Client:
                 with self._lock:
                     self._suback_rc[rpid] = rc
                     ev = self._subacks.get(rpid)
+                    if ev is not None:
+                        self._suback_rc[rpid] = rc
                 if ev:
                     ev.set()
             elif ptype == CONNACK:

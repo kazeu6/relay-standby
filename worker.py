@@ -36,31 +36,45 @@ VER = os.environ.get("VENICE_VER", "interface@20261111.090351+046c490")
 MIDDLEFACE = os.environ.get("VENICE_MIDDLEFACE", "0.1.1234")
 MODEL = "deepseek-v4-1-flash-uncensored"
 
-TOPIC = os.environ.get("TOPIC", "")
-POOL = os.environ.get("POOL") or ((TOPIC + "-p") if TOPIC else "")
-IDLE = int(os.environ.get("IDLE", "600"))
-CAP = int(os.environ.get("CAP", "8"))
-MQTT_HOST = os.environ.get("MQTT_HOST", "broker.hivemq.com")
-MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
-MQTT_TLS = os.environ.get("MQTT_TLS", "1").strip().lower() not in (
-    "0", "false", "no", "off", "")
-MQTT_USER = os.environ.get("MQTT_USER") or None
-MQTT_PASS = os.environ.get("MQTT_PASS") or None
+def _env_int(nama, default):
+    v = os.environ.get(nama)
+    if v is None or not v.strip():
+        return int(default)
+    return int(v.strip())
+
+
+TOPIC = (os.environ.get("TOPIC") or "").strip()
+POOL = (os.environ.get("POOL") or "").strip() or ((TOPIC + "-p") if TOPIC else "")
+IDLE = _env_int("IDLE", 600)
+CAP = _env_int("CAP", 8)
+MQTT_HOST = (os.environ.get("MQTT_HOST") or "").strip() or "broker.hivemq.com"
+MQTT_PORT = _env_int("MQTT_PORT", 8883)
+_MQTT_TLS_RAW = (os.environ.get("MQTT_TLS") or "").strip().lower()
+MQTT_TLS = (_MQTT_TLS_RAW or "1") not in ("0", "false", "no", "off")
+MQTT_USER = (os.environ.get("MQTT_USER") or "").strip() or None
+MQTT_PASS = (os.environ.get("MQTT_PASS") or "").strip() or None
+BUS_KEY = os.environ.get("BUS_KEY") or os.environ.get("VENICE_BUS_KEY") or ""
 WID = uuid.uuid4().hex[:8]
-VER_WORKER = "19"
+VER_WORKER = "20"
 
 _BUS = [None]
 _KIRIM = []
 _KIRIM_LOCK = threading.Lock()
+_KIRIM_MAX_DELTA = 200
+_KIRIM_MAX_TOTAL = 500
 
 H = {"content-type": "application/json",
      "origin": "https://venice.ai",
      "referer": "https://venice.ai/chat/classic",
      "user-agent": UA}
 
-# Sesi HTTP per-thread agar beberapa thread `kerja` tidak saling merusak state
-# libcurl. Variabel modul `S` tetap dipertahankan sebagai hook untuk unit test.
+# Sesi HTTP per-thread + idle keep-alive pool agar giliran berurutan di worker
+# sticky memakai ulang koneksi HTTP/2 + TLS ke edge Venice yang sama, sementara
+# thread paralel tetap tidak pernah berbagi handle libcurl secara bersamaan.
 _SESI = threading.local()
+_SESI_IDLE = []
+_SESI_LOCK = threading.Lock()
+_SESI_IDLE_MAKS = 4
 S = None
 
 
@@ -69,31 +83,77 @@ def _session():
         return S
     s = getattr(_SESI, "s", None)
     if s is None:
-        s = cr.Session(impersonate="chrome")
-        s.headers.update({"user-agent": UA})
+        with _SESI_LOCK:
+            s = _SESI_IDLE.pop() if _SESI_IDLE else None
+        if s is None:
+            s = cr.Session(impersonate="chrome")
+            s.headers.update({"user-agent": UA})
         _SESI.s = s
     return s
 
 
-def publish(topic, payload, penting=False):
-    """Kirim laporan lewat MQTT tanpa memblokir thread pembaca."""
+def _rilis_sesi():
+    """Kembalikan sesi thread yang selesai ke pool idle keep-alive secara aman."""
+    if S is not None:
+        return
+    s = getattr(_SESI, "s", None)
+    if s is None:
+        return
+    _SESI.s = None
+    buang = False
+    with _SESI_LOCK:
+        if len(_SESI_IDLE) < _SESI_IDLE_MAKS:
+            _SESI_IDLE.append(s)
+        else:
+            buang = True
+    if buang:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def _antre_kirim_locked(item, depan=False):
+    """Masukkan pesan ke antrean `_KIRIM`; pesan `penting=True` tak pernah kalah oleh delta."""
+    _, _, penting = item
+    if penting:
+        if len(_KIRIM) >= _KIRIM_MAX_TOTAL:
+            # Buang pesan non-penting (delta/beat) paling tua agar pesan penting tetap masuk.
+            for idx, (_, _, p_lama) in enumerate(_KIRIM):
+                if not p_lama:
+                    _KIRIM.pop(idx)
+                    break
+        if len(_KIRIM) < _KIRIM_MAX_TOTAL:
+            if depan:
+                _KIRIM.insert(0, item)
+            else:
+                _KIRIM.append(item)
+    else:
+        if len(_KIRIM) < _KIRIM_MAX_DELTA:
+            _KIRIM.append(item)
+
+
+def publish(topic, payload, penting=False, bus_key=None):
+    """Kirim laporan lewat MQTT tanpa memblokir thread pembaca dan menjaga urutan."""
     payload = {**payload, "ts": time.time()}
-    data = json.dumps(payload)
+    key = BUS_KEY if bus_key is None else bus_key
+    data = mqtt.seal_frame(key, topic, payload) if key else json.dumps(payload)
+    with _KIRIM_LOCK:
+        ada_antre = bool(_KIRIM)
     c = _BUS[0]
-    if c and c.connected:
+    if not ada_antre and c and c.connected:
         try:
             c.publish(topic, data)
             return True
         except Exception as e:
             print("publish lewat bus gagal: %s" % str(e)[:80], flush=True)
     with _KIRIM_LOCK:
-        if len(_KIRIM) < 200:
-            _KIRIM.append((topic, data, penting))
+        _antre_kirim_locked((topic, data, penting))
     return False
 
 
 def _pengirim(stop):
-    """Kirim ulang pesan yang gagal lewat koneksi sekali pakai."""
+    """Kirim ulang pesan yang gagal lewat bus aktif atau koneksi sekali pakai secara terurut."""
     while not stop.is_set():
         with _KIRIM_LOCK:
             butir = _KIRIM.pop(0) if _KIRIM else None
@@ -120,8 +180,7 @@ def _pengirim(stop):
             print("publish cadangan gagal: %s" % str(e)[:80], flush=True)
             if penting:
                 with _KIRIM_LOCK:
-                    if len(_KIRIM) < 100:
-                        _KIRIM.append((topic, data, penting))
+                    _antre_kirim_locked((topic, data, penting), depan=True)
             stop.wait(0.5)
         finally:
             if t is not None:
@@ -139,23 +198,33 @@ class Tokens:
         self.minted_at = 0.0
         self.lock = threading.Lock()
 
+    def _isi_locked(self):
+        self.tokens.clear()
+        mint_start = time.monotonic()
+        m = _session().post(
+            "https://outerface.venice.ai/api/app/user/client_attestation/mint",
+            headers=H, json={"count": 5, "env": ATTEST_ENV}, timeout=30)
+        m.raise_for_status()
+        d = m.json()
+        if isinstance(d.get("token"), str):
+            self.tokens = [d["token"]]
+        elif isinstance(d.get("tokens"), list) and d["tokens"]:
+            self.tokens = [t["token"] if isinstance(t, dict) else str(t)
+                           for t in d["tokens"]]
+        else:
+            raise RuntimeError("mint: tidak ada token (%s)" % list(d.keys()))
+        self.minted_at = mint_start
+
+    def warm(self):
+        """Panaskan cache token tanpa membuang 1 token."""
+        with self.lock:
+            if not self.tokens or (time.monotonic() - self.minted_at > 240):
+                self._isi_locked()
+
     def get(self, paksa=False):
         with self.lock:
             if paksa or not self.tokens or (time.monotonic() - self.minted_at > 240):
-                self.tokens.clear()
-                m = _session().post(
-                    "https://outerface.venice.ai/api/app/user/client_attestation/mint",
-                    headers=H, json={"count": 5, "env": ATTEST_ENV}, timeout=30)
-                m.raise_for_status()
-                d = m.json()
-                if isinstance(d.get("token"), str):
-                    self.tokens = [d["token"]]
-                elif isinstance(d.get("tokens"), list) and d["tokens"]:
-                    self.tokens = [t["token"] if isinstance(t, dict) else str(t)
-                                   for t in d["tokens"]]
-                else:
-                    raise RuntimeError("mint: tidak ada token (%s)" % list(d.keys()))
-                self.minted_at = time.monotonic()
+                self._isi_locked()
             return self.tokens.pop(0)
 
 
@@ -175,8 +244,44 @@ _ISFILE_MIN_CHARS = 40000
 _ISFILE_HIST_MIN = 16000
 _TAIL_USER_MAX = 35000
 _SYS_MAX_CHARS = 120000
-_MAX_RESP_DEFAULT = int(os.environ.get("VENICE_MAX_RESP_TOKENS", "131072"))
+_MAX_RESP_DEFAULT = _env_int("VENICE_MAX_RESP_TOKENS", 131072)
 _SEP_PERCAKAPAN = "\n\n===== PERCAKAPAN =====\n\n"
+_DEAD_ZONE_MIN = 68000
+_DEAD_ZONE_MAX = 85500
+_SAFE_PAD_TARGET = 87000
+_PAD_BLOCK = "<!-- [system-specification-rfc9000-flow-control-alignment-block] -->\n"
+
+
+def _selaraskan_body_dead_zone(body):
+    """Hindari WAF 413 Dead Zone [68k - 85.5k] pada payload body Classic tanpa memutasi `systemPrompt`."""
+    raw_len = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+    if not (_DEAD_ZONE_MIN <= raw_len <= _DEAD_ZONE_MAX):
+        return body
+    kurang = _SAFE_PAD_TARGET - raw_len + 64
+    repeat = (kurang // len(_PAD_BLOCK)) + 1
+    pad = "\n" + (_PAD_BLOCK * repeat)
+    if body.get("prompt"):
+        p_arr = body["prompt"]
+        p0 = p_arr[0]
+        if (isinstance(p0, dict) and p0.get("role", "user") == "user"
+                and isinstance(p0.get("content"), str)):
+            p0["content"] = pad + "\n" + p0["content"]
+            if len(p0["content"]) >= _ISFILE_MIN_CHARS and not p0.get("isFile"):
+                p0["isFile"] = True
+        else:
+            item = {"role": "user", "content": pad}
+            if len(pad) >= _ISFILE_MIN_CHARS:
+                item["isFile"] = True
+            p_arr.insert(0, item)
+        if isinstance(p_arr[-1], dict) and p_arr[-1].get("isFile"):
+            p_arr.append({
+                "role": "user",
+                "content": (
+                    "Lanjutkan percakapan di atas dan balas langsung sebagai "
+                    "Assistant sesuai instruksi sistem."
+                ),
+            })
+    return body
 
 
 def _opsi_reasoning(opts=None):
@@ -215,27 +320,30 @@ def _susun_turns_classic(turns):
             sys_parts.append(content.strip())
             continue
         mulai_conv = True
+        orig_role = role
         if role not in ("user", "assistant"):
             role = "user"
         if conv and conv[-1]["role"] == role:
-            conv[-1]["content"] += "\n\n" + content
+            # Jangan lebur penanda `system` ekor (pengingat tool / padding) ke dalam
+            # pesan `user` besar (>= 40k `isFile`) agar batas blok file historis
+            # tetap 100% identik untuk KV-cache di giliran berikutnya!
+            if orig_role == "system" and role == "user" and len(conv[-1]["content"]) >= _ISFILE_MIN_CHARS:
+                conv.append({"role": "user", "content": content})
+            else:
+                conv[-1]["content"] += "\n\n" + content
         else:
             conv.append({"role": role, "content": content})
 
     if not any(x["role"] == "user" for x in conv):
         conv.append({"role": "user", "content": "Lanjutkan sesuai instruksi sistem."})
 
-    total_conv = sum(len(x["content"]) for x in conv)
-    last_idx = len(conv) - 1
+    # Aturan `isFile` 100% intrinsik per pesan (tidak bergantung `idx < last_idx`
+    # atau `total_conv`) supaya representasi token pesan lama tidak pernah flip-flop!
     out = []
-    for idx, x in enumerate(conv):
+    for x in conv:
         item = {"role": x["role"], "content": x["content"]}
-        n_c = len(x["content"])
-        if x["role"] == "user":
-            if n_c >= _ISFILE_MIN_CHARS or (
-                total_conv >= _ISFILE_MIN_CHARS and idx < last_idx and n_c >= _ISFILE_HIST_MIN
-            ):
-                item["isFile"] = True
+        if x["role"] == "user" and len(x["content"]) >= _ISFILE_MIN_CHARS:
+            item["isFile"] = True
         out.append(item)
 
     if out and out[-1].get("isFile"):
@@ -284,8 +392,9 @@ def _classic_body(prompt, lcc_on=True, opts=None):
             else:
                 p_arr.insert(0, {"role": "user", "content": sys_txt, "isFile": True})
         body["prompt"] = p_arr
+        _selaraskan_body_dead_zone(body)
         total_len = len(body.get("systemPrompt") or "") + sum(
-            len(x.get("content") or "") for x in p_arr
+            len(x.get("content") or "") for x in body["prompt"]
         )
         if lcc_on and total_len >= _LCC_MIN_CHARS:
             body["enableLargeContextChat"] = True
@@ -318,7 +427,11 @@ def _classic_body(prompt, lcc_on=True, opts=None):
     else:
         body["prompt"] = [{"role": "user", "content": isi}]
 
-    if lcc_on and len(prompt or "") >= _LCC_MIN_CHARS:
+    _selaraskan_body_dead_zone(body)
+    total_len = len(body.get("systemPrompt") or "") + sum(
+        len(x.get("content") or "") for x in body["prompt"]
+    )
+    if lcc_on and max(len(prompt or ""), total_len) >= _LCC_MIN_CHARS:
         body["enableLargeContextChat"] = True
     return body
 
@@ -344,25 +457,64 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None, opts=None):
         lcc_on = _LCC[0]
     body = _classic_body(prompt, lcc_on=lcc_on, opts=opts)
 
+    def _siap_ulang(paksa_tok=False):
+        body["requestId"] = str(uuid.uuid4())
+        hdr["x-venice-request-timestamp-ms"] = str(int(time.time() * 1000))
+        try:
+            tok_baru = TOK.get(paksa=paksa_tok)
+            if tok_baru:
+                hdr["x-venice-client-attestation"] = tok_baru
+        except Exception:
+            pass
+
+    def _err_l(resp):
+        try:
+            return (resp.text or "").lower()
+        except Exception:
+            return ""
+
     r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
     try:
-        if r.status_code == 400 and body.get("enableLargeContextChat"):
-            _tutup_resp(r)
-            with _LCC_LOCK:
-                _LCC[0] = False
-            body.pop("enableLargeContextChat", None)
-            r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
+        # Urutan fallback HTTP 400 aman: systemPrompt > 32k DULU sebelum LCC,
+        # lalu sampling bila disebut error, lalu LCC (hanya matikan _LCC jika
+        # melepasnya benar-benar menyembuhkan 400!), lalu sampling umum.
         if r.status_code == 400 and len(body.get("systemPrompt") or "") > 32000:
             _tutup_resp(r)
             sp = body.pop("systemPrompt", "")
             if sp:
                 body["prompt"] = [{"role": "user", "content": sp, "isFile": True}] + list(body.get("prompt") or [])
+            _siap_ulang()
             r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
+
+        if (r.status_code == 400
+                and any(k in body for k in ("maxResponseTokens", "temperature", "topP"))
+                and any(w in _err_l(r) for w in ("maxresponsetokens", "temperature", "topp", "sampling"))):
+            _tutup_resp(r)
+            for k in ("maxResponseTokens", "temperature", "topP"):
+                body.pop(k, None)
+            _siap_ulang()
+            r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
+
+        if r.status_code == 400 and body.get("enableLargeContextChat"):
+            _tutup_resp(r)
+            body.pop("enableLargeContextChat", None)
+            _siap_ulang()
+            r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
+            if r.status_code == 200:
+                with _LCC_LOCK:
+                    _LCC[0] = False
+            else:
+                # Melepas LCC tidak menyembuhkan 400 (atau terkena 401/429/5xx) ->
+                # JANGAN racuni `_LCC` secara permanen!
+                body["enableLargeContextChat"] = True
+
         if r.status_code == 400 and any(k in body for k in ("maxResponseTokens", "temperature", "topP")):
             _tutup_resp(r)
             for k in ("maxResponseTokens", "temperature", "topP"):
                 body.pop(k, None)
+            _siap_ulang()
             r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
+
         if r.status_code in (401, 403):
             try:
                 tok_baru = TOK.get(paksa=True)
@@ -370,6 +522,8 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None, opts=None):
                 tok_baru = None
             if tok_baru:
                 _tutup_resp(r)
+                body["requestId"] = str(uuid.uuid4())
+                hdr["x-venice-request-timestamp-ms"] = str(int(time.time() * 1000))
                 hdr["x-venice-client-attestation"] = tok_baru
                 r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT,
                               stream=True)
@@ -406,7 +560,12 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None, opts=None):
             k = o.get("kind") or "(tanpa kind)"
             jenis[k] = jenis.get(k, 0) + 1
             if k in ("reasoning", "thinking"):
-                potong = o.get("content") or o.get("reasoning_content") or o.get("reasoning") or o.get("thinking") or ""
+                potong = ""
+                for fk in ("content", "reasoning_content", "reasoning", "thinking"):
+                    fv = o.get(fk)
+                    if isinstance(fv, str) and fv:
+                        potong = fv
+                        break
                 if potong:
                     cadangan += potong
                     if not dalam_think[0]:
@@ -418,7 +577,9 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None, opts=None):
             if k == "content":
                 # Venice Classic mengirim penalaran pada field `reasoning_content` di dalam `kind="content"`.
                 rc = o.get("reasoning_content")
-                potong = o.get("content") or ""
+                potong = o.get("content")
+                if not isinstance(potong, str):
+                    potong = ""
                 maju = False
                 if isinstance(rc, str) and rc:
                     cadangan += rc
@@ -443,16 +604,35 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None, opts=None):
                 cadangan += potong
             return False
 
-        for ln in r.iter_lines():
+        selesai_stream = threading.Event()
+        if stop_check:
+            def _pantau_batal():
+                while not selesai_stream.wait(0.25):
+                    try:
+                        if stop_check():
+                            _tutup_resp(r)
+                            return
+                    except Exception:
+                        return
+            threading.Thread(target=_pantau_batal, daemon=True).start()
+
+        try:
+            for ln in r.iter_lines():
+                if stop_check and stop_check():
+                    return "", 499, 0, "dibatalkan pengelola"
+                if isinstance(ln, bytes):
+                    ln = ln.decode("utf-8", "replace")
+                if not ln:
+                    continue
+                teks_datang = proses(ln)
+                if teks_datang and on_maju:
+                    on_maju(len(ln))
+        except Exception:
             if stop_check and stop_check():
                 return "", 499, 0, "dibatalkan pengelola"
-            if isinstance(ln, bytes):
-                ln = ln.decode("utf-8", "replace")
-            if not ln:
-                continue
-            teks_datang = proses(ln)
-            if teks_datang and on_maju:
-                on_maju(len(ln))
+            raise
+        finally:
+            selesai_stream.set()
 
         if dalam_think[0]:
             dalam_think[0] = False
@@ -558,12 +738,19 @@ class WorkerRuntime:
     """State dan dispatcher pesan untuk satu instance worker."""
 
     def __init__(self, wid=None, pool_topic=None, cap=None, idle=None,
-                 pub_fn=None, ask_fn=None):
+                 pub_fn=None, ask_fn=None, bus_key=None, run_topic=None):
         self.wid = wid or WID
         self.pool_topic = pool_topic if pool_topic is not None else POOL
+        self.run_topic = run_topic if run_topic is not None else TOPIC
+        self.bus_key = BUS_KEY if bus_key is None else bus_key
+        self._replay = mqtt.ReplayGuard()
         self.cap = CAP if cap is None else int(cap)
         self.idle = IDLE if idle is None else int(idle)
-        self._pub = pub_fn or publish
+        if pub_fn is not None:
+            self._pub = pub_fn
+        else:
+            self._pub = lambda t, pl, penting=False: publish(
+                t, pl, penting=penting, bus_key=self.bus_key)
         self._ask = ask_fn or ask_ulang
 
         self.stop = threading.Event()
@@ -598,8 +785,15 @@ class WorkerRuntime:
         return False
 
     def on_msg(self, o):
+        raw = o.get("message", "")
+        if self.bus_key:
+            try:
+                raw = mqtt.open_frame(self.bus_key, self.run_topic, raw,
+                                      replay_guard=self._replay)
+            except ValueError:
+                return
         try:
-            task = json.loads(o.get("message", ""))
+            task = json.loads(raw)
         except Exception:
             return
         if not isinstance(task, dict):
@@ -738,6 +932,7 @@ class WorkerRuntime:
                 opts=task_opts or None)
         except Exception as e:
             nadi_stop.set()
+            _rilis_sesi()
             with self.kunci:
                 self.doing = max(0, self.doing - 1)
                 self.last_task = time.monotonic()
@@ -747,9 +942,12 @@ class WorkerRuntime:
             self._pub(self.pool_topic, res, penting=True)
             return
 
+        _rilis_sesi()
         if self._is_cancelled(tid):
             nadi_stop.set()
             with self.kunci:
+                if status == 200 and ans:
+                    self.used += 1
                 self.doing = max(0, self.doing - 1)
                 self.last_task = time.monotonic()
                 self.batal_set.discard(tid)
@@ -790,7 +988,8 @@ def main():
     except Exception:
         ip = "?"
 
-    rt = WorkerRuntime(wid=WID, pool_topic=pool_topik, cap=CAP, idle=IDLE)
+    rt = WorkerRuntime(wid=WID, pool_topic=pool_topik, cap=CAP, idle=IDLE,
+                       run_topic=topik)
 
     threading.Thread(target=listen, args=(rt.stop, rt.on_msg, topik), daemon=True).start()
     threading.Thread(target=_pengirim, args=(rt.stop,), daemon=True).start()
@@ -804,26 +1003,28 @@ def main():
         return
 
     try:
-        TOK.get()
+        TOK.warm()
     except Exception as e:
         print("gagal panaskan token: %s" % str(e)[:120], flush=True)
 
     publish(pool_topik, {"t": "up", "id": WID, "ip": ip, "v": VER_WORKER,
-                         "warm": int((time.monotonic() - t0) * 1000)})
+                         "warm": int((time.monotonic() - t0) * 1000)},
+            bus_key=rt.bus_key)
     print("worker %s siap ip=%s warm=%dms" % (
         WID, ip, (time.monotonic() - t0) * 1000), flush=True)
 
     def beat():
-        while not rt.stop.is_set():
-            if rt.stop.wait(15):
+        while not rt.stop.is_set() and not rt.draining.is_set():
+            if rt.stop.wait(15) or rt.draining.is_set():
                 return
             publish(pool_topik, {"t": "up", "id": WID, "ip": ip, "beat": True,
-                                 "v": VER_WORKER})
+                                 "v": VER_WORKER}, bus_key=rt.bus_key)
             with rt.kunci:
                 yatim_age = time.monotonic() - rt.yatim_at
             if yatim_age > 90:
                 print("tidak disapa pengelola 90s, keluar (yatim)", flush=True)
-                rt.stop.set()
+                # Pakai draining agar main() sempat mengirim `down` sebelum bus dimatikan!
+                rt.draining.set()
                 return
 
     threading.Thread(target=beat, daemon=True).start()
@@ -833,9 +1034,17 @@ def main():
 
     with rt.kunci:
         used_final = rt.used
-    # Kirim laporan `down` SEBELUM menyetel `stop`, supaya bus/pengirim sempat mengirim.
-    publish(pool_topik, {"t": "down", "id": WID, "used": used_final}, penting=True)
-    time.sleep(0.2)
+    # Kirim laporan `down` SEBELUM menyetel `stop`, lalu tunggu antrean penting terkuras.
+    publish(pool_topik, {"t": "down", "id": WID, "used": used_final},
+            penting=True, bus_key=rt.bus_key)
+    flush_dl = time.monotonic() + 2.0
+    while time.monotonic() < flush_dl:
+        with _KIRIM_LOCK:
+            masih_penting = any(p for _, _, p in _KIRIM)
+        if not masih_penting:
+            break
+        time.sleep(0.05)
+    time.sleep(0.1)
     rt.stop.set()
     print("worker %s keluar, dipakai %d kali" % (WID, used_final), flush=True)
 
