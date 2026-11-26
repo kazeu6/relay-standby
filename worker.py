@@ -55,7 +55,7 @@ MQTT_USER = (os.environ.get("MQTT_USER") or "").strip() or None
 MQTT_PASS = (os.environ.get("MQTT_PASS") or "").strip() or None
 BUS_KEY = os.environ.get("BUS_KEY") or os.environ.get("VENICE_BUS_KEY") or ""
 WID = uuid.uuid4().hex[:8]
-VER_WORKER = "20"
+VER_WORKER = "21"
 
 _BUS = [None]
 _KIRIM = []
@@ -296,6 +296,22 @@ def _opsi_reasoning(opts=None):
     return True
 
 
+def _opsi_reasoning_effort(opts=None):
+    """Tentukan tingkat `reasoningEffort` Classic ('low' | 'high' | 'max')."""
+    raw = ""
+    if isinstance(opts, dict) and isinstance(opts.get("reasoning_effort"), str):
+        raw = opts["reasoning_effort"].strip().lower()
+    if not raw:
+        raw = (os.environ.get("VENICE_REASONING_EFFORT") or "high").strip().lower()
+    if raw in ("minimal", "low"):
+        return "low"
+    if raw in ("xhigh", "max"):
+        return "max"
+    if raw in ("medium", "high", "on", "enabled"):
+        return "high"
+    return "high"
+
+
 def _susun_turns_classic(turns):
     """Ubah daftar `turns` OpenAI-like menjadi `(system_prompt, prompt_array)` natif Classic.
 
@@ -360,6 +376,7 @@ def _susun_turns_classic(turns):
 def _classic_body(prompt, lcc_on=True, opts=None):
     """Bangun body Classic `/api/inference/chat` (native multi-turn + anti-truncation hingga 1M char)."""
     opts = opts if isinstance(opts, dict) else {}
+    reas = _opsi_reasoning(opts)
     body = {
         "modelId": MODEL,
         "requestId": str(uuid.uuid4()),
@@ -367,8 +384,10 @@ def _classic_body(prompt, lcc_on=True, opts=None):
         "webEnabled": False,
         "webScrapeEnabled": False,
         "xSearchEnabled": False,
-        "reasoning": _opsi_reasoning(opts),
+        "reasoning": reas,
     }
+    if reas:
+        body["reasoningEffort"] = _opsi_reasoning_effort(opts)
 
     mt = opts.get("max_tokens")
     if isinstance(mt, int) and not isinstance(mt, bool) and mt > 0:
@@ -480,17 +499,21 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None, opts=None):
         # melepasnya benar-benar menyembuhkan 400!), lalu sampling umum.
         if r.status_code == 400 and len(body.get("systemPrompt") or "") > 32000:
             _tutup_resp(r)
-            sp = body.pop("systemPrompt", "")
-            if sp:
-                body["prompt"] = [{"role": "user", "content": sp, "isFile": True}] + list(body.get("prompt") or [])
+            sp = body.get("systemPrompt") or ""
+            # Pertahankan 28k karakter pertama tetap di `systemPrompt` berotoritas tinggi;
+            # hanya limpahkan sisanya ke `prompt[0]` (`isFile: True`) agar model tidak kehilangan sistem.
+            body["systemPrompt"] = sp[:28000]
+            sisa_sp = sp[28000:].strip()
+            if sisa_sp:
+                body["prompt"] = [{"role": "user", "content": sisa_sp, "isFile": True}] + list(body.get("prompt") or [])
             _siap_ulang()
             r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
 
         if (r.status_code == 400
-                and any(k in body for k in ("maxResponseTokens", "temperature", "topP"))
-                and any(w in _err_l(r) for w in ("maxresponsetokens", "temperature", "topp", "sampling"))):
+                and any(k in body for k in ("maxResponseTokens", "temperature", "topP", "reasoningEffort"))
+                and any(w in _err_l(r) for w in ("maxresponsetokens", "temperature", "topp", "sampling", "reasoning"))):
             _tutup_resp(r)
-            for k in ("maxResponseTokens", "temperature", "topP"):
+            for k in ("maxResponseTokens", "temperature", "topP", "reasoningEffort"):
                 body.pop(k, None)
             _siap_ulang()
             r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
@@ -508,9 +531,9 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None, opts=None):
                 # JANGAN racuni `_LCC` secara permanen!
                 body["enableLargeContextChat"] = True
 
-        if r.status_code == 400 and any(k in body for k in ("maxResponseTokens", "temperature", "topP")):
+        if r.status_code == 400 and any(k in body for k in ("maxResponseTokens", "temperature", "topP", "reasoningEffort")):
             _tutup_resp(r)
-            for k in ("maxResponseTokens", "temperature", "topP"):
+            for k in ("maxResponseTokens", "temperature", "topP", "reasoningEffort"):
                 body.pop(k, None)
             _siap_ulang()
             r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
