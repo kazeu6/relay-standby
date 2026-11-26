@@ -521,13 +521,3 @@ class Client:
         t = threading.Thread(target=self.loop, daemon=True)
         t.start()
         return t
-
-
-def make(on_message=None, host="broker.hivemq.com", port=8883, client_id=None,
-         tls=True, username=None, password=None):
-    """Buat klien yang sudah tersambung (belum subscribe)."""
-    c = Client(host=host, port=port, client_id=client_id, tls=tls,
-               username=username, password=password)
-    c.on_message = on_message
-    c.connect()
-    return c
