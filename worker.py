@@ -12,6 +12,7 @@ Env:
 import base64
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -55,7 +56,7 @@ MQTT_USER = (os.environ.get("MQTT_USER") or "").strip() or None
 MQTT_PASS = (os.environ.get("MQTT_PASS") or "").strip() or None
 BUS_KEY = os.environ.get("BUS_KEY") or os.environ.get("VENICE_BUS_KEY") or ""
 WID = uuid.uuid4().hex[:8]
-VER_WORKER = "22"
+VER_WORKER = "23"
 
 _BUS = [None]
 _KIRIM = []
@@ -256,6 +257,32 @@ _TUTUP_ISFILE = (
     "Lanjutkan percakapan di atas dan balas langsung sebagai "
     "Assistant sesuai instruksi sistem."
 )
+_DATA_PREFIX_RE = re.compile(r"^\s*data:[^;]+;base64,", re.I)
+_MAX_IMAGES = 10
+
+
+def _bersih_b64_gambar(vals):
+    """Normalisasi daftar lampiran gambar menjadi list base64 mentah tanpa prefix `data:...;base64,`."""
+    if not isinstance(vals, list):
+        return []
+    out = []
+    for v in vals:
+        if not isinstance(v, str):
+            continue
+        s = _DATA_PREFIX_RE.sub("", v.strip())
+        s = "".join(s.split())
+        if s:
+            out.append(s)
+    return out
+
+
+def _panjang_json_teks(body):
+    """Ukuran UTF-8 JSON body tanpa base64 `imagePath` agar lampiran gambar tak memicu dead-zone."""
+    p_bersih = [
+        {k: v for k, v in m.items() if k != "imagePath"} if isinstance(m, dict) else m
+        for m in (body.get("prompt") or [])
+    ]
+    return len(json.dumps({**body, "prompt": p_bersih}, ensure_ascii=False).encode("utf-8"))
 
 
 def _ambang_isfile(sys_len):
@@ -271,7 +298,7 @@ def _ambang_isfile(sys_len):
 
 def _selaraskan_body_dead_zone(body):
     """Hindari WAF 413 Dead Zone [68k - 85.5k] pada payload body Classic tanpa memutasi `systemPrompt`."""
-    raw_len = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+    raw_len = _panjang_json_teks(body)
     if not (_DEAD_ZONE_MIN <= raw_len <= _DEAD_ZONE_MAX):
         return body
     kurang = _SAFE_PAD_TARGET - raw_len + 64
@@ -282,7 +309,7 @@ def _selaraskan_body_dead_zone(body):
         p_arr = body["prompt"]
         p0 = p_arr[0]
         if (isinstance(p0, dict) and p0.get("role", "user") == "user"
-                and isinstance(p0.get("content"), str)):
+                and isinstance(p0.get("content"), str) and not p0.get("imagePath")):
             p0["content"] = pad + "\n" + p0["content"]
             if len(p0["content"]) >= isfile_min and not p0.get("isFile"):
                 p0["isFile"] = True
@@ -309,6 +336,25 @@ def _mitigasi_413(body, tahap, lcc_on=True):
     sp = body.get("systemPrompt") or ""
     p_arr = [dict(x) if isinstance(x, dict) else x for x in (body.get("prompt") or [])]
 
+    def _promosi_user(arr, batas_len):
+        nonlocal berubah
+        baru = []
+        for item in arr:
+            if (isinstance(item, dict) and item.get("role") == "user"
+                    and not item.get("isFile")
+                    and isinstance(item.get("content"), str)
+                    and len(item["content"]) >= batas_len):
+                if item.get("imagePath"):
+                    baru.append({"role": "user", "content": item["content"], "isFile": True})
+                    baru.append({"role": "user", "content": "", "imagePath": list(item["imagePath"])})
+                else:
+                    item["isFile"] = True
+                    baru.append(item)
+                berubah = True
+            else:
+                baru.append(item)
+        return baru
+
     if tahap == 1:
         if len(sp) > _SYS_SPLIT_KEEP:
             body["systemPrompt"] = sp[:_SYS_SPLIT_KEEP]
@@ -316,13 +362,7 @@ def _mitigasi_413(body, tahap, lcc_on=True):
             if sisa_sp:
                 p_arr.insert(0, {"role": "user", "content": sisa_sp, "isFile": True})
             berubah = True
-        for item in p_arr:
-            if (isinstance(item, dict) and item.get("role") == "user"
-                    and not item.get("isFile")
-                    and isinstance(item.get("content"), str)
-                    and len(item["content"]) >= 2000):
-                item["isFile"] = True
-                berubah = True
+        p_arr = _promosi_user(p_arr, 2000)
         if p_arr and isinstance(p_arr[-1], dict) and p_arr[-1].get("isFile"):
             p_arr.append({"role": "user", "content": _TUTUP_ISFILE})
             berubah = True
@@ -337,13 +377,7 @@ def _mitigasi_413(body, tahap, lcc_on=True):
             body.pop("systemPrompt", None)
             p_arr.insert(0, {"role": "user", "content": sp, "isFile": True})
             berubah = True
-        for item in p_arr:
-            if (isinstance(item, dict) and item.get("role") == "user"
-                    and not item.get("isFile")
-                    and isinstance(item.get("content"), str)
-                    and len(item["content"]) >= 500):
-                item["isFile"] = True
-                berubah = True
+        p_arr = _promosi_user(p_arr, 500)
         if p_arr and isinstance(p_arr[-1], dict) and p_arr[-1].get("isFile"):
             p_arr.append({"role": "user", "content": _TUTUP_ISFILE})
             berubah = True
@@ -399,43 +433,71 @@ def _susun_turns_classic(turns):
             continue
         role = (m.get("role") or "user").strip().lower()
         content = m.get("content")
-        if not isinstance(content, str) or not content.strip():
+        if not isinstance(content, str):
+            content = ""
+        imgs = _bersih_b64_gambar(m.get("images") or m.get("imagePath")) if role not in ("system", "assistant") else []
+        if not content.strip() and not imgs:
             continue
         if role == "system" and not mulai_conv:
             sys_parts.append(content.strip())
             continue
         mulai_conv = True
-        rest.append((role, content))
+        rest.append((role, content, imgs))
 
     sys_txt = "\n\n".join(sys_parts).strip()
     eff_sys_len = _SYS_SPLIT_KEEP if len(sys_txt) > _SYS_MAX_CHARS else len(sys_txt)
     isfile_min = _ambang_isfile(eff_sys_len)
 
     conv = []
-    for orig_role, content in rest:
+    for orig_role, content, imgs in rest:
         role = orig_role if orig_role in ("user", "assistant") else "user"
         if conv and conv[-1]["role"] == role:
             # Jangan lebur penanda `system` ekor (pengingat tool / padding) ke dalam
-            # pesan `user` besar (`isFile`) agar batas blok file historis
-            # tetap 100% identik untuk KV-cache di giliran berikutnya!
-            if orig_role == "system" and role == "user" and len(conv[-1]["content"]) >= isfile_min:
-                conv.append({"role": "user", "content": content})
+            # pesan `user` besar (`isFile`) atau pesan bergambar agar KV-cache utuh!
+            if orig_role == "system" and role == "user" and (
+                    len(conv[-1]["content"]) >= isfile_min or conv[-1].get("images")):
+                conv.append({"role": "user", "content": content, "images": imgs})
             else:
-                conv[-1]["content"] += "\n\n" + content
+                if content:
+                    conv[-1]["content"] = (
+                        (conv[-1]["content"] + "\n\n" + content)
+                        if conv[-1]["content"] else content
+                    )
+                if imgs:
+                    conv[-1]["images"] = (conv[-1].get("images") or []) + imgs
         else:
-            conv.append({"role": role, "content": content})
+            conv.append({"role": role, "content": content, "images": imgs})
 
     if not any(x["role"] == "user" for x in conv):
-        conv.append({"role": "user", "content": "Lanjutkan sesuai instruksi sistem."})
+        conv.append({"role": "user", "content": "Lanjutkan sesuai instruksi sistem.", "images": []})
+
+    # Batasi total gambar maksimal `_MAX_IMAGES` (10) paling baru sesuai spek Venice.
+    if sum(len(x.get("images") or ()) for x in conv) > _MAX_IMAGES:
+        sisa_img = _MAX_IMAGES
+        for x in reversed(conv):
+            if x.get("images"):
+                x["images"] = x["images"][-sisa_img:] if sisa_img > 0 else []
+                sisa_img = max(0, sisa_img - len(x["images"]))
 
     # Aturan `isFile` 100% intrinsik per pesan (hanya bergantung `len(sys_txt)`
     # yang statis lintas-turn, bukan posisi `idx < last_idx`) supaya representasi
     # token pesan lama tidak pernah flip-flop!
     out = []
     for x in conv:
+        imgs = x.get("images") or []
+        if x["role"] == "user" and imgs and len(x["content"]) >= isfile_min:
+            out.append({"role": "user", "content": x["content"], "isFile": True})
+            out.append({
+                "role": "user",
+                "content": "Perhatikan gambar terlampir sesuai konteks di atas.",
+                "imagePath": imgs,
+            })
+            continue
         item = {"role": x["role"], "content": x["content"]}
         if x["role"] == "user" and len(x["content"]) >= isfile_min:
             item["isFile"] = True
+        if x["role"] == "user" and imgs:
+            item["imagePath"] = imgs
         out.append(item)
 
     if out and out[-1].get("isFile"):
