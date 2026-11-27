@@ -55,7 +55,7 @@ MQTT_USER = (os.environ.get("MQTT_USER") or "").strip() or None
 MQTT_PASS = (os.environ.get("MQTT_PASS") or "").strip() or None
 BUS_KEY = os.environ.get("BUS_KEY") or os.environ.get("VENICE_BUS_KEY") or ""
 WID = uuid.uuid4().hex[:8]
-VER_WORKER = "21"
+VER_WORKER = "22"
 
 _BUS = [None]
 _KIRIM = []
@@ -241,14 +241,32 @@ _LCC_LOCK = threading.Lock()
 _LCC = [True]
 _LCC_MIN_CHARS = 66000
 _ISFILE_MIN_CHARS = 40000
+_ISFILE_MIN_DYNAMIC = 8000
+_SINGLE_TURN_SAFE_CHARS = 64000
 _TAIL_USER_MAX = 35000
-_SYS_MAX_CHARS = 120000
+_SYS_MAX_CHARS = 64000
+_SYS_SPLIT_KEEP = 28000
 _MAX_RESP_DEFAULT = _env_int("VENICE_MAX_RESP_TOKENS", 131072)
 _SEP_PERCAKAPAN = "\n\n===== PERCAKAPAN =====\n\n"
 _DEAD_ZONE_MIN = 68000
 _DEAD_ZONE_MAX = 85500
 _SAFE_PAD_TARGET = 87000
 _PAD_BLOCK = "<!-- [system-specification-rfc9000-flow-control-alignment-block] -->\n"
+_TUTUP_ISFILE = (
+    "Lanjutkan percakapan di atas dan balas langsung sebagai "
+    "Assistant sesuai instruksi sistem."
+)
+
+
+def _ambang_isfile(sys_len):
+    """Ambang intrinsik `isFile: True` per pesan `user` untuk mencegah HTTP 413 `USER_PROMPT_TOO_LONG`.
+
+    Venice membatasi gabungan `systemPrompt + prompt[-1]` non-file pada tier gratis (~25k token / ~80k char).
+    Karena hanya bergantung pada panjang `systemPrompt` (yang statis sepanjang sesi), ambang ini tetap
+    konstan lintas-turn sehingga bebas flip-flop KV-cache.
+    """
+    sisa = _SINGLE_TURN_SAFE_CHARS - int(sys_len or 0)
+    return min(_ISFILE_MIN_CHARS, max(_ISFILE_MIN_DYNAMIC, sisa))
 
 
 def _selaraskan_body_dead_zone(body):
@@ -259,28 +277,80 @@ def _selaraskan_body_dead_zone(body):
     kurang = _SAFE_PAD_TARGET - raw_len + 64
     repeat = (kurang // len(_PAD_BLOCK)) + 1
     pad = "\n" + (_PAD_BLOCK * repeat)
+    isfile_min = _ambang_isfile(len(body.get("systemPrompt") or ""))
     if body.get("prompt"):
         p_arr = body["prompt"]
         p0 = p_arr[0]
         if (isinstance(p0, dict) and p0.get("role", "user") == "user"
                 and isinstance(p0.get("content"), str)):
             p0["content"] = pad + "\n" + p0["content"]
-            if len(p0["content"]) >= _ISFILE_MIN_CHARS and not p0.get("isFile"):
+            if len(p0["content"]) >= isfile_min and not p0.get("isFile"):
                 p0["isFile"] = True
         else:
             item = {"role": "user", "content": pad}
-            if len(pad) >= _ISFILE_MIN_CHARS:
+            if len(pad) >= isfile_min:
                 item["isFile"] = True
             p_arr.insert(0, item)
         if isinstance(p_arr[-1], dict) and p_arr[-1].get("isFile"):
-            p_arr.append({
-                "role": "user",
-                "content": (
-                    "Lanjutkan percakapan di atas dan balas langsung sebagai "
-                    "Assistant sesuai instruksi sistem."
-                ),
-            })
+            p_arr.append({"role": "user", "content": _TUTUP_ISFILE})
     return body
+
+
+def _mitigasi_413(body, tahap, lcc_on=True):
+    """Ubah bentuk payload Classic secara deterministik saat Venice membalas HTTP 413 (`USER_PROMPT_TOO_LONG`).
+
+    Kembalikan True jika payload berubah dan layak dicoba ulang.
+    """
+    berubah = False
+    if lcc_on and not body.get("enableLargeContextChat"):
+        body["enableLargeContextChat"] = True
+        berubah = True
+
+    sp = body.get("systemPrompt") or ""
+    p_arr = [dict(x) if isinstance(x, dict) else x for x in (body.get("prompt") or [])]
+
+    if tahap == 1:
+        if len(sp) > _SYS_SPLIT_KEEP:
+            body["systemPrompt"] = sp[:_SYS_SPLIT_KEEP]
+            sisa_sp = sp[_SYS_SPLIT_KEEP:].strip()
+            if sisa_sp:
+                p_arr.insert(0, {"role": "user", "content": sisa_sp, "isFile": True})
+            berubah = True
+        for item in p_arr:
+            if (isinstance(item, dict) and item.get("role") == "user"
+                    and not item.get("isFile")
+                    and isinstance(item.get("content"), str)
+                    and len(item["content"]) >= 2000):
+                item["isFile"] = True
+                berubah = True
+        if p_arr and isinstance(p_arr[-1], dict) and p_arr[-1].get("isFile"):
+            p_arr.append({"role": "user", "content": _TUTUP_ISFILE})
+            berubah = True
+        elif (p_arr and isinstance(p_arr[-1], dict)
+              and p_arr[-1].get("role") != "user"
+              and isinstance(p_arr[-1].get("content"), str)
+              and len(p_arr[-1]["content"]) >= 2000):
+            p_arr.append({"role": "user", "content": "Lanjutkan sesuai instruksi sistem."})
+            berubah = True
+    else:
+        if sp:
+            body.pop("systemPrompt", None)
+            p_arr.insert(0, {"role": "user", "content": sp, "isFile": True})
+            berubah = True
+        for item in p_arr:
+            if (isinstance(item, dict) and item.get("role") == "user"
+                    and not item.get("isFile")
+                    and isinstance(item.get("content"), str)
+                    and len(item["content"]) >= 500):
+                item["isFile"] = True
+                berubah = True
+        if p_arr and isinstance(p_arr[-1], dict) and p_arr[-1].get("isFile"):
+            p_arr.append({"role": "user", "content": _TUTUP_ISFILE})
+            berubah = True
+
+    if berubah:
+        body["prompt"] = p_arr
+    return berubah
 
 
 def _opsi_reasoning(opts=None):
@@ -322,7 +392,7 @@ def _susun_turns_classic(turns):
       `user`/`assistant` normal memakai chat template asli DeepSeek V4.1.
     """
     sys_parts = []
-    conv = []
+    rest = []
     mulai_conv = False
     for m in turns or []:
         if not isinstance(m, dict):
@@ -335,14 +405,20 @@ def _susun_turns_classic(turns):
             sys_parts.append(content.strip())
             continue
         mulai_conv = True
-        orig_role = role
-        if role not in ("user", "assistant"):
-            role = "user"
+        rest.append((role, content))
+
+    sys_txt = "\n\n".join(sys_parts).strip()
+    eff_sys_len = _SYS_SPLIT_KEEP if len(sys_txt) > _SYS_MAX_CHARS else len(sys_txt)
+    isfile_min = _ambang_isfile(eff_sys_len)
+
+    conv = []
+    for orig_role, content in rest:
+        role = orig_role if orig_role in ("user", "assistant") else "user"
         if conv and conv[-1]["role"] == role:
             # Jangan lebur penanda `system` ekor (pengingat tool / padding) ke dalam
-            # pesan `user` besar (>= 40k `isFile`) agar batas blok file historis
+            # pesan `user` besar (`isFile`) agar batas blok file historis
             # tetap 100% identik untuk KV-cache di giliran berikutnya!
-            if orig_role == "system" and role == "user" and len(conv[-1]["content"]) >= _ISFILE_MIN_CHARS:
+            if orig_role == "system" and role == "user" and len(conv[-1]["content"]) >= isfile_min:
                 conv.append({"role": "user", "content": content})
             else:
                 conv[-1]["content"] += "\n\n" + content
@@ -352,24 +428,19 @@ def _susun_turns_classic(turns):
     if not any(x["role"] == "user" for x in conv):
         conv.append({"role": "user", "content": "Lanjutkan sesuai instruksi sistem."})
 
-    # Aturan `isFile` 100% intrinsik per pesan (tidak bergantung `idx < last_idx`
-    # atau `total_conv`) supaya representasi token pesan lama tidak pernah flip-flop!
+    # Aturan `isFile` 100% intrinsik per pesan (hanya bergantung `len(sys_txt)`
+    # yang statis lintas-turn, bukan posisi `idx < last_idx`) supaya representasi
+    # token pesan lama tidak pernah flip-flop!
     out = []
     for x in conv:
         item = {"role": x["role"], "content": x["content"]}
-        if x["role"] == "user" and len(x["content"]) >= _ISFILE_MIN_CHARS:
+        if x["role"] == "user" and len(x["content"]) >= isfile_min:
             item["isFile"] = True
         out.append(item)
 
     if out and out[-1].get("isFile"):
-        out.append({
-            "role": "user",
-            "content": (
-                "Lanjutkan percakapan di atas dan balas langsung sebagai "
-                "Assistant sesuai instruksi sistem."
-            ),
-        })
-    return "\n\n".join(sys_parts).strip(), out
+        out.append({"role": "user", "content": _TUTUP_ISFILE})
+    return sys_txt, out
 
 
 def _classic_body(prompt, lcc_on=True, opts=None):
@@ -408,7 +479,10 @@ def _classic_body(prompt, lcc_on=True, opts=None):
             if len(sys_txt) <= _SYS_MAX_CHARS:
                 body["systemPrompt"] = sys_txt
             else:
-                p_arr.insert(0, {"role": "user", "content": sys_txt, "isFile": True})
+                body["systemPrompt"] = sys_txt[:_SYS_SPLIT_KEEP]
+                sisa_sp = sys_txt[_SYS_SPLIT_KEEP:].strip()
+                if sisa_sp:
+                    p_arr.insert(0, {"role": "user", "content": sisa_sp, "isFile": True})
         body["prompt"] = p_arr
         _selaraskan_body_dead_zone(body)
         total_len = len(body.get("systemPrompt") or "") + sum(
@@ -421,13 +495,21 @@ def _classic_body(prompt, lcc_on=True, opts=None):
     isi = prompt or ""
     if _SEP_PERCAKAPAN in isi:
         kepala, ekor = isi.split(_SEP_PERCAKAPAN, 1)
-        if kepala.strip() and len(kepala) <= _SYS_MAX_CHARS and ekor.strip():
-            body["systemPrompt"] = kepala.strip()
-            isi = ekor
+        if kepala.strip() and ekor.strip():
+            kepala_s = kepala.strip()
+            if len(kepala_s) <= _SYS_MAX_CHARS:
+                body["systemPrompt"] = kepala_s
+                isi = ekor
+            else:
+                body["systemPrompt"] = kepala_s[:_SYS_SPLIT_KEEP]
+                sisa_k = kepala_s[_SYS_SPLIT_KEEP:].strip()
+                isi = (sisa_k + "\n\n" + ekor) if sisa_k else ekor
 
-    if len(isi) >= _ISFILE_MIN_CHARS:
+    isfile_min = _ambang_isfile(len(body.get("systemPrompt") or ""))
+    tail_max = min(_TAIL_USER_MAX, max(4000, isfile_min))
+    if len(isi) >= isfile_min:
         idx_u = isi.rfind("\n\nUser: ")
-        if idx_u >= 1000 and (len(isi) - idx_u) < _TAIL_USER_MAX:
+        if idx_u >= 1000 and (len(isi) - idx_u) < tail_max:
             hist = isi[:idx_u]
             tail = isi[idx_u + 2:]
             body["prompt"] = [
@@ -437,10 +519,7 @@ def _classic_body(prompt, lcc_on=True, opts=None):
         else:
             body["prompt"] = [
                 {"role": "user", "content": isi, "isFile": True},
-                {"role": "user", "content": (
-                    "Lanjutkan percakapan di atas dan balas langsung sebagai "
-                    "Assistant sesuai instruksi sistem."
-                )},
+                {"role": "user", "content": _TUTUP_ISFILE},
             ]
     else:
         body["prompt"] = [{"role": "user", "content": isi}]
@@ -493,6 +572,17 @@ def ask(prompt, on_delta=None, on_maju=None, stop_check=None, opts=None):
 
     r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
     try:
+        # Pemulihan otomatis HTTP 413 (`USER_PROMPT_TOO_LONG` pada tier gratis ~25k tok/single-turn):
+        # pecah systemPrompt > 28k & naikkan pesan user besar ke `isFile: True` + penutup pendek.
+        for tahap_413 in (1, 2):
+            if r.status_code != 413:
+                break
+            if not _mitigasi_413(body, tahap_413, lcc_on=lcc_on):
+                continue
+            _tutup_resp(r)
+            _siap_ulang()
+            r = sesi.post(CHAT_URL, headers=hdr, json=body, timeout=_HTTP_TIMEOUT, stream=True)
+
         # Urutan fallback HTTP 400 aman: systemPrompt > 32k DULU sebelum LCC,
         # lalu sampling bila disebut error, lalu LCC (hanya matikan _LCC jika
         # melepasnya benar-benar menyembuhkan 400!), lalu sampling umum.
