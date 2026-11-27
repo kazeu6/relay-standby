@@ -56,7 +56,7 @@ MQTT_USER = (os.environ.get("MQTT_USER") or "").strip() or None
 MQTT_PASS = (os.environ.get("MQTT_PASS") or "").strip() or None
 BUS_KEY = os.environ.get("BUS_KEY") or os.environ.get("VENICE_BUS_KEY") or ""
 WID = uuid.uuid4().hex[:8]
-VER_WORKER = "23"
+VER_WORKER = "24"
 
 _BUS = [None]
 _KIRIM = []
@@ -240,10 +240,11 @@ _HTTP_TIMEOUT = (15, 120)
 
 _LCC_LOCK = threading.Lock()
 _LCC = [True]
-_LCC_MIN_CHARS = 66000
+_LCC_MIN_CHARS = 64000
 _ISFILE_MIN_CHARS = 40000
 _ISFILE_MIN_DYNAMIC = 8000
 _SINGLE_TURN_SAFE_CHARS = 64000
+_NON_FILE_BUDGET_CHARS = 64000
 _TAIL_USER_MAX = 35000
 _SYS_MAX_CHARS = 64000
 _SYS_SPLIT_KEEP = 28000
@@ -323,6 +324,60 @@ def _selaraskan_body_dead_zone(body):
     return body
 
 
+def _jaga_anggaran_non_file(body):
+    """Jaga `len(systemPrompt) + sum(non-isFile prompt)` <= `_NON_FILE_BUDGET_CHARS` (64k).
+
+    Mencegah pemotongan diam-diam (silent truncation / amnesia) pada jendela gratis 25k token
+    Venice sekaligus mencegah HTTP 413 `USER_PROMPT_TOO_LONG`:
+    - Mempromosikan giliran tertua (baik `user` maupun `assistant`, kecuali item bergambar)
+      secara monoton dari depan ke `isFile: True` hingga sisa non-`isFile` <= 64k.
+    - Promosi monoton menjaga prefix historis 100% stabil untuk KV-cache lintas-turn.
+    """
+    p_arr = body.get("prompt")
+    if not isinstance(p_arr, list) or not p_arr:
+        return body
+    sys_len = len(body.get("systemPrompt") or "")
+    non_file = sys_len + sum(
+        len(x.get("content") or "")
+        for x in p_arr
+        if isinstance(x, dict) and not x.get("isFile")
+    )
+    if non_file <= _NON_FILE_BUDGET_CHARS:
+        return body
+
+    baru = []
+    last_i = len(p_arr) - 1
+    for idx_x, x in enumerate(p_arr):
+        if non_file <= _NON_FILE_BUDGET_CHARS:
+            baru.extend(p_arr[idx_x:])
+            break
+        if not isinstance(x, dict) or x.get("isFile"):
+            baru.append(x)
+            continue
+        isi = x.get("content")
+        c_len = len(isi) if isinstance(isi, str) else 0
+        if c_len == 0 or (idx_x == last_i and c_len <= 200):
+            baru.append(x)
+            continue
+        if x.get("imagePath"):
+            if c_len >= 500:
+                baru.append({"role": "user", "content": isi, "isFile": True})
+                baru.append({"role": "user", "content": "", "imagePath": list(x["imagePath"])})
+                non_file -= c_len
+            else:
+                baru.append(x)
+            continue
+        salin = dict(x)
+        salin["isFile"] = True
+        baru.append(salin)
+        non_file -= c_len
+
+    if baru and isinstance(baru[-1], dict) and baru[-1].get("isFile") and baru[-1].get("role") == "user":
+        baru.append({"role": "user", "content": _TUTUP_ISFILE})
+    body["prompt"] = baru
+    return body
+
+
 def _mitigasi_413(body, tahap, lcc_on=True):
     """Ubah bentuk payload Classic secara deterministik saat Venice membalas HTTP 413 (`USER_PROMPT_TOO_LONG`).
 
@@ -336,11 +391,11 @@ def _mitigasi_413(body, tahap, lcc_on=True):
     sp = body.get("systemPrompt") or ""
     p_arr = [dict(x) if isinstance(x, dict) else x for x in (body.get("prompt") or [])]
 
-    def _promosi_user(arr, batas_len):
+    def _promosi_turn(arr, batas_len):
         nonlocal berubah
         baru = []
         for item in arr:
-            if (isinstance(item, dict) and item.get("role") == "user"
+            if (isinstance(item, dict) and item.get("role") in ("user", "assistant")
                     and not item.get("isFile")
                     and isinstance(item.get("content"), str)
                     and len(item["content"]) >= batas_len):
@@ -362,8 +417,8 @@ def _mitigasi_413(body, tahap, lcc_on=True):
             if sisa_sp:
                 p_arr.insert(0, {"role": "user", "content": sisa_sp, "isFile": True})
             berubah = True
-        p_arr = _promosi_user(p_arr, 2000)
-        if p_arr and isinstance(p_arr[-1], dict) and p_arr[-1].get("isFile"):
+        p_arr = _promosi_turn(p_arr, 2000)
+        if p_arr and isinstance(p_arr[-1], dict) and p_arr[-1].get("isFile") and p_arr[-1].get("role") == "user":
             p_arr.append({"role": "user", "content": _TUTUP_ISFILE})
             berubah = True
         elif (p_arr and isinstance(p_arr[-1], dict)
@@ -377,8 +432,8 @@ def _mitigasi_413(body, tahap, lcc_on=True):
             body.pop("systemPrompt", None)
             p_arr.insert(0, {"role": "user", "content": sp, "isFile": True})
             berubah = True
-        p_arr = _promosi_user(p_arr, 500)
-        if p_arr and isinstance(p_arr[-1], dict) and p_arr[-1].get("isFile"):
+        p_arr = _promosi_turn(p_arr, 500)
+        if p_arr and isinstance(p_arr[-1], dict) and p_arr[-1].get("isFile") and p_arr[-1].get("role") == "user":
             p_arr.append({"role": "user", "content": _TUTUP_ISFILE})
             berubah = True
 
@@ -547,6 +602,7 @@ def _classic_body(prompt, lcc_on=True, opts=None):
                     p_arr.insert(0, {"role": "user", "content": sisa_sp, "isFile": True})
         body["prompt"] = p_arr
         _selaraskan_body_dead_zone(body)
+        _jaga_anggaran_non_file(body)
         total_len = len(body.get("systemPrompt") or "") + sum(
             len(x.get("content") or "") for x in body["prompt"]
         )
@@ -587,6 +643,7 @@ def _classic_body(prompt, lcc_on=True, opts=None):
         body["prompt"] = [{"role": "user", "content": isi}]
 
     _selaraskan_body_dead_zone(body)
+    _jaga_anggaran_non_file(body)
     total_len = len(body.get("systemPrompt") or "") + sum(
         len(x.get("content") or "") for x in body["prompt"]
     )
